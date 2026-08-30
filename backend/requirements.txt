@@ -1,0 +1,44 @@
+﻿flask==3.0.3
+flask-cors==4.0.1
+requests>=2.32.0
+beautifulsoup4>=4.12.0
+langchain>=1.0.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.1.0
+langchain-text-splitters>=1.0.0
+faiss-cpu>=1.8.0
+sentence-transformers>=2.2.2
+numpy==1.26.4
+openai==2.32.0
+pandas==2.2.2
+scikit-learn==1.5.0
+# Pinned to <5.0: transformers 5.x changed PreTrainedTokenizer.__setattr__'s
+# special-token handling (self._special_tokens_map no longer lazily created),
+# which breaks IndicTrans2's remote-code IndicTransTokenizer (it sets
+# self.unk_token before calling super().__init__()). 4.57.1 is the latest
+# pre-5.0 release that still loads IndicTrans2 correctly under this pin.
+# (MMS-TTS/VitsModel -- see tts_service.py -- is natively supported by
+# transformers, no remote code, so it isn't a factor in this pin.)
+transformers==4.57.1
+# Plain `pip install -r requirements.txt` grabs the CPU-only wheel on
+# Windows, which silently runs IndicTrans2 on CPU float32
+# (translation_service.py auto-detects and uses CUDA when present, fp32 CPU
+# otherwise -- no code changes needed either way, but CPU is 4-10x slower).
+# On a CUDA machine, install the matching GPU build instead, e.g. for driver
+# CUDA 13.x:
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.12.0+cu130
+torch>=2.1.0
+sentencepiece>=0.2.0
+einops>=0.8.0
+indic-nlp-library>=0.92
+mysql-connector-python>=9.0.0
+certifi>=2024.0.0
+pypdf>=4.2.0
+ollama>=0.1.0
+portkey-ai>=2.3.4
+psutil>=5.9.0
+waitress>=2.2.0
+faster-whisper>=1.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=1.0.0

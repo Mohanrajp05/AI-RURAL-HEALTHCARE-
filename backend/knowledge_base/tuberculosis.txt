@@ -1,0 +1,21 @@
+# Tuberculosis
+
+**Source:** https://www.who.int/news-room/fact-sheets/detail/tuberculosis
+
+## Symptoms
+In general, people with TB infection don’t feel sick and are not contagious. Only a small proportion of people who get infected with TB will get TB disease and develop symptoms. Babies and children are at higher risk of developing the disease if they are infected. TB disease occurs when bacteria multiply in the body and affect different organs. TB symptoms may be mild for many months, so it is easy to spread TB to others without knowing it. Symptoms depend on which part of the body is affected. While TB usually affects the lungs, it can also affect the kidneys, brain, and spine. Some people with TB disease do not have any symptoms but can still spread TB. Common symptoms of TB are: prolonged cough (sometimes with blood); chest pain; weakness; fatigue; weight loss; fever; and night sweats The symptoms people get depend on which part of the body is affected by TB. While TB usually affects the lungs, it can also involve the kidneys, brain, spine and skin.
+
+## Causes
+Overview Tuberculosis (TB) is an infectious disease caused by bacteria that most often affects the lungs. It spreads through the air when people with TB cough, sneeze or spit. The results from these TB infection tests are used to identify which individuals with a high risk of TB will benefit most from TB preventive treatment. MDR-TB is a form of TB caused by bacteria that do not respond to rifampicin and isoniazid, the two most effective first-line TB drugs. TB caused by bacteria that do not respond to the most effective drugs in MDR-TB treatment regimens can leave patients with very limited treatment options.
+
+## Prevention
+Follow these steps to help prevent tuberculosis infection and spread: Seek medical attention if you have symptoms like prolonged cough, fever and unexplained weight loss as early treatment for TB can help stop the spread of disease and improve your chances of recovery. Get screened for TB if you are at increased risk, such as if you have HIV or are in contact with people who have TB in your household or workplace. TB preventive treatment (or TPT) prevents infection from becoming disease. If prescribed TPT, complete the full course. If you have TB, practice good hygiene when coughing, including avoiding contact with other people and wearing a mask, covering your mouth and nose when coughing or sneezing, and disposing of sputum and used tissues properly. Special measures, like respirators and well-ventilated spaces are important to reduce infection in healthcare facilities and other institutions.
+
+## Treatment
+Tuberculosis disease is treated with special antibiotics. Treatment is recommended for both TB infection and disease. The most common antibiotics used are: rifampicin; isoniazid; pyrazinamide; and ethambutol. To be effective, medications need to be taken daily for 4–6 months. It is dangerous to stop the medications early or without medical advice as it can prompt TB bacteria in the body to become resistant to the antibiotics. TB that doesn’t respond to standard drugs is called drug-resistant TB and requires treatment with different medicines.
+
+## Diet Recommendations
+Certain conditions can increase a person’s risk for TB disease: diabetes (high blood sugar); weakened immune system (for example, from HIV); undernutrition; tobacco use; and harmful use of alcohol. Those with compromised immune systems, such as people living with HIV, undernutrition or diabetes, or people who use tobacco have a higher risk of falling ill. Globally in 2024, there were an estimated 0.97 million new TB cases that were attributable to undernutrition, 0.93 million to diabetes, 0.74 million to alcohol use disorders, 0.70 million to smoking and 0.57 million to HIV infection.
+
+## When To See A Doctor
+Prevention Follow these steps to help prevent tuberculosis infection and spread: Seek medical attention if you have symptoms like prolonged cough, fever and unexplained weight loss as early treatment for TB can help stop the spread of disease and improve your chances of recovery.

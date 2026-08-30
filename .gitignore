@@ -1,0 +1,67 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+.config/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+.env.production
+
+# API Keys and credentials
+*.key
+*.pem
+secrets.json
+credentials.json
+.aws/
+.gcp/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Runtime data stores (chat history, uploaded attachments, doctor account
+# password hashes, patient assessment records) -- real user/health data
+# generated while the app runs, not source. Kept on disk, just not
+# committed. patients.json in particular holds patient health records
+# (PII/PHI) -- was previously untracked but NOT actually excluded here,
+# meaning a plain `git add .` would have committed it.
+backend/uploads/
+backend/chat_store.json
+backend/doctor_accounts.json
+backend/patients.json
+backend/server.pid
+
+# Ad-hoc local test/debug output dumps (not part of the app or test suite)
+backend/*_check_results.json
+backend/lang_*.json
+backend/tts_amplitude_check.json
+backend/tts_test_results.json
+backend/mapcheck.txt
+backend/out.txt
+backend/symptom_check.txt
+backend/translit_check*.txt
+backend/_it2_tts_test_*.wav

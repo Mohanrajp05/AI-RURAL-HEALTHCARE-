@@ -1,0 +1,21 @@
+# Typhoid
+
+**Source:** https://www.who.int/news-room/fact-sheets/detail/typhoid
+
+## Symptoms
+Salmonella Typhi lives only in humans. Persons with typhoid fever carry the bacteria in their bloodstream and intestinal tract. Symptoms include prolonged high fever, fatigue, headache, nausea, abdominal pain, and constipation or diarrhoea. Some patients may have a rash. Severe cases may lead to serious complications or even death. Typhoid fever can be confirmed through blood testing.
+
+## Causes
+Improved living conditions and the introduction of antibiotics resulted in a drastic reduction of typhoid fever morbidity and mortality in industrialized countries. However, the disease continues to be a public health problem in many developing areas of the WHO African, Eastern Mediterranean, South-East Asia and Western Pacific Regions. As of 2019 estimates, there are 9 million cases of typhoid fever annually, resulting in about 110 000 deaths per year. Typhoid risk is higher in populations that lack access to safe water and adequate sanitation, and children are at highest risk.
+
+## Prevention
+Typhoid fever is common in places with poor sanitation and a lack of safe drinking water. Access to safe water and adequate sanitation, hygiene among food handlers and typhoid vaccination are all effective in preventing typhoid fever. Typhoid conjugate vaccine, consisting of the purified Vi antigen linked to a carrier protein, is given as a single injectable dose in children from 6 months of age and in adults up to 45 years or 65 years (depending on the vaccine). Two additional vaccines have been used for many years in older children and adults at risk of typhoid, including travellers. These vaccines do not provide long-lasting immunity (requiring repeat or booster doses) and are not approved for children younger than 2 years old: an injectable vaccine based on the purified antigen for people aged 2 years and above; and a live attenuated oral vaccine in capsule formulation for people aged over 6 years. Two typhoid conjugate vaccines have been prequalified by WHO since December 2017 and are being introduced into childhood immunization programmes in typhoid endemic countries. All travellers to endemic areas are at potential risk of typhoid fever, although the risk is generally low in tourist and business centres where standards of accommodation, sanitation and food hygiene are high. Typhoid fever vaccination should be offered to travellers to destinations where the risk of typhoid fever is high. The following recommendations will help ensure safety while travelling: Ensure food is properly cooked and still hot when served. Avoid raw milk and products made from raw milk. Drink only pasteurized or boiled milk. Avoid ice unless it is made from safe water. When the safety of drinking water is questionable, boil it, or if this is not possible, disinfect it with a reliable, slow-release disinfectant agent (usually available at pharmacies). Wash hands thoroughly and frequently using soap, in particular after contact with pets or farm animals, or after having been to the toilet. Wash fruits and vegetables carefully, particularly if they are eaten raw. If possible, vegetables and fruits should be peeled.
+
+## Treatment
+Typhoid fever can be treated with antibiotics. Antimicrobial resistance is common with likelihood of more complicated and expensive treatment options required in the most affected regions. Even when the symptoms go away, people may still be carrying typhoid bacteria, meaning they can spread it to others, through shedding of bacteria in their faeces. It is important for people being treated for typhoid fever to do the following: Take prescribed antibiotics for as long as the doctor has prescribed. Wash their hands with soap and water after using the bathroom and avoid preparing or serving food for other people. This will lower the chance of passing the infection on to someone else. Have their doctor test to ensure that no Salmonella Typhi bacteria remain in their body.
+
+## Diet Recommendations
+Information not found on the source page for this field.
+
+## When To See A Doctor
+Information not found on the source page for this field.

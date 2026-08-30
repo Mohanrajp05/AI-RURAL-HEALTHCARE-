@@ -1,0 +1,21 @@
+# Pneumonia
+
+**Source:** https://www.who.int/news-room/fact-sheets/detail/pneumonia
+
+## Symptoms
+Information not found on the source page for this field.
+
+## Causes
+Pneumonia is caused by several infectious agents, including viruses, bacteria and fungi. The most common are the following. Streptococcus pneumoniae is the most common cause of bacterial pneumonia in children. Haemophilus influenzae type b (Hib) is the second most common cause of bacterial pneumonia. Respiratory syncytial virus is the most common viral cause of pneumonia. In infants infected with HIV, Pneumocystis jiroveci is one of the most common causes of pneumonia, responsible for at least one quarter of all pneumonia deaths in HIV-infected infants.
+
+## Prevention
+Preventing pneumonia in children is an essential component of a strategy to reduce child mortality. Immunization against Hib, pneumococcus, measles and whooping cough (pertussis) is the most effective way to prevent pneumonia. Adequate nutrition is key to improving children's natural defences, starting with exclusive breastfeeding for the first 6 months of life. In addition to being effective in preventing pneumonia, it also helps to reduce the length of the illness if a child does become ill. Addressing environmental factors such as indoor air pollution (by providing affordable clean indoor stoves, for example) and encouraging good hygiene in crowded homes also reduces the number of children who fall ill with pneumonia. In children infected with HIV, the antibiotic cotrimoxazole is given daily to decrease the risk of contracting pneumonia.
+
+## Treatment
+Pneumonia should be treated with antibiotics. The antibiotic of choice for first line treatment is amoxicillin dispersible tablets. Most cases of pneumonia require oral antibiotics, which are often prescribed at a health centre. These cases can also be diagnosed and treated with inexpensive oral antibiotics at the community level by trained community health workers. Hospitalization is recommended only for severe cases of pneumonia.
+
+## Diet Recommendations
+Pneumonia can be prevented by immunization, adequate nutrition, and by addressing environmental factors. A child's immune system may be weakened by malnutrition or undernourishment, especially in infants who are not exclusively breastfed. Adequate nutrition is key to improving children's natural defences, starting with exclusive breastfeeding for the first 6 months of life.
+
+## When To See A Doctor
+Information not found on the source page for this field.

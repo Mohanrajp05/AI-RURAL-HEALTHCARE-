@@ -1,0 +1,21 @@
+# Hepatitis D
+
+**Source:** https://www.who.int/news-room/fact-sheets/detail/hepatitis-d
+
+## Symptoms
+Simultaneous infection with HBV and HDV can lead to mild-to-severe hepatitis with signs and symptoms of indistinguishable from those of other types of acute viral hepatitis infections. These features typically appear 3–7 weeks after initial infection and include fever, fatigue, loss of appetite, nausea, vomiting, dark urine, pale-coloured stools, jaundice (yellow eyes) and even fulminant hepatitis. However, recovery is usually complete, development of fulminant hepatitis is infrequent, and progression to chronic hepatitis D is rare (less than 5% of acute hepatitis). In a superinfection, HDV can infect a person already chronically infected with HBV. The superinfection of HDV on chronic hepatitis B accelerates progression to a more severe disease in all ages and in 70‒90% of persons. HDV superinfection markedly accelerates progression to cirrhosis when compared with HBV mono-infected persons. Patients with HDV induced cirrhosis are at an increased risk of hepatocellular carcinoma (HCC); however, the mechanism in which HDV causes more severe hepatitis and a faster progression of fibrosis than HBV alone remains unclear.
+
+## Causes
+Overview Hepatitis D is an inflammation of the liver caused by the hepatitis D virus (HDV), which requires hepatitis B virus (HBV) for its replication. Transmission HDV is blood borne and transmitted in the same way as HBV. It may also be transmitted through sexual intercourse, or rarely from a mother to her child before or around birth (vertical transmission). WHO response Global health sector strategies on, respectively, HIV, viral hepatitis, and sexually transmitted infections for the period 2022–2030 (GHSS) guide the health sector in implementing strategically focused responses to achieve the goals of ending AIDS, viral hepatitis (especially chronic hepatitis B and C) and sexually transmitted infections by 2030.
+
+## Prevention
+Prevention services of hepatitis D should focus on reducing HBV transmission through hepatitis B immunization, including timely birth dose, additional antiviral prophylaxis for eligible pregnant women, blood safety, safe injection practices in health-care settings and harm reduction services with clean needles and syringes. Hepatitis B immunization does not provide protection against HDV for those already infected with HBV.
+
+## Treatment
+Until recently, pegylated interferon α (PEG-IFNα) had been the only treatment option for chronic HDV. However, its use has been limited by poor treatment outcomes, side-effects and contraindications. Only about 20–30% of those treated with PEG-IFNα achieve complete virological response under treatment, and relapse is frequent. The HDV treatment landscape is now rapidly evolving, with some novel agents showing favourable results. In 2023, Bulevirtide, an entry inhibitor that is given once daily through subcutaneous injection, received approval for treatment of chronic HDV by the European Medicines Agency (EMA) among adults with compensated liver disease. Several multi-centre studies continue to evaluate best treatment dosage, treatment duration and possible combination with PEG-IFNα. Nucleoside analogues used for hepatitis B treatment have shown no direct benefit in controlling HDV although they are generally used for managing the chronic HBV infection.
+
+## Diet Recommendations
+Information not found on the source page for this field.
+
+## When To See A Doctor
+Information not found on the source page for this field.

@@ -1,0 +1,3428 @@
+import os
+import sys
+import smtplib
+import tempfile
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import json
+import hashlib
+import pickle
+import difflib
+from datetime import datetime
+import pandas as pd
+from collections import deque
+from pymongo import MongoClient, DESCENDING
+import re
+import warnings
+from pathlib import Path
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+# Guard heavy ML imports to allow the server to start on machines
+# where these libraries (torch/transformers) are not installed or
+# their native dependencies are missing (common on some Windows setups).
+try:
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+except Exception:
+    AutoTokenizer = None
+    AutoModelForSeq2SeqLM = None
+
+try:
+    import torch
+except Exception:
+    torch = None
+import psutil
+from time import time
+from threading import Timer
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail
+except Exception:
+    SendGridAPIClient = None
+    Mail = None
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from chatbot_response import (
+    chatbot_response,
+    clear_chat_session,
+    _set_session_disease,
+    _get_session_disease,
+    _SESSION_HISTORY,
+    update_disease_context,
+)
+from chatbot_pipeline import multilingual_chatbot as pipeline_process_query
+
+SMTP_USER = os.environ.get("SMTP_USER", "your_email@gmail.com")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "your_app_password")
+FEEDBACK_TO_EMAIL = os.environ.get("FEEDBACK_TO_EMAIL", "info@ruralhealthcare.com")
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+try:
+    SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+except ValueError:
+    SMTP_PORT = 587
+
+app = Flask(__name__)
+CORS(app)
+
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
+
+
+def limit_response_words(text: str, max_words: int = 300) -> str:
+    if not text:
+        return text
+    words = str(text).split()
+    if len(words) <= max_words:
+        return text
+    truncated = " ".join(words[:max_words])
+    last_period = max(truncated.rfind('.'), truncated.rfind('!'), truncated.rfind('?'))
+    if last_period != -1:
+        return truncated[: last_period + 1]
+    else:
+        return truncated + '.'
+
+# ===== MEMORY MANAGEMENT & CRASH PREVENTION =====
+MAX_SESSIONS = 100  # Limit total sessions to prevent unbounded memory growth
+
+def cleanup_old_sessions():
+    """Remove sessions that haven't been used in 30 minutes."""
+    from chatbot_response import _SESSION_LAST_DISEASE
+    now = datetime.now()
+    expired = [
+        sid for sid, data in _SESSION_LAST_DISEASE.items()
+        if (now - data.get("timestamp", now)).seconds > 1800
+    ]
+    for sid in expired:
+        _SESSION_LAST_DISEASE.pop(sid, None)
+        _SESSION_HISTORY.pop(sid, None)
+        _SESSION_LAST_RESPONSE.pop(sid, None)
+        _MISTRAL_LAST_CALL.pop(sid, None)
+    if expired:
+        print(f"[Memory] Cleaned up {len(expired)} expired sessions. Active: {len(_SESSION_LAST_DISEASE)}")
+
+def schedule_cleanup():
+    """Schedule cleanup to run every 15 minutes."""
+    cleanup_old_sessions()
+    Timer(900, schedule_cleanup).daemon = True
+    Timer(900, schedule_cleanup).start()
+
+# Start cleanup scheduler at startup
+schedule_cleanup()
+
+# Response limit per session to prevent abuse
+MAX_RESPONSES = 10
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "500"))
+
+
+def _trim_to_word_boundary(text: str, max_chars: int) -> str:
+    """Trim text to a max length without cutting in the middle of a word."""
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars]
+    boundary = re.match(r"^([\s\S]*?)\s+\S*$", clipped)
+    return (boundary.group(1) if boundary else clipped).rstrip()
+
+# Mistral rate limiter - prevent overwhelming the API
+_MISTRAL_LAST_CALL = {}
+MISTRAL_MIN_INTERVAL = 2  # Minimum 2 seconds between Mistral calls
+
+def can_call_mistral(session_id: str) -> bool:
+    """Check if enough time has passed since last Mistral call for this session."""
+    now = time()
+    last = _MISTRAL_LAST_CALL.get(session_id, 0)
+    if now - last < MISTRAL_MIN_INTERVAL:
+        return False
+    _MISTRAL_LAST_CALL[session_id] = now
+    return True
+
+def call_mistral_with_timeout(prompt: str, timeout_secs: int = 15) -> str:
+    """Call Mistral with timeout protection to prevent hanging."""
+    try:
+        # Import ollama locally to avoid top-level dependency
+        try:
+            import ollama
+        except ImportError:
+            return "I recommend consulting a nearby doctor or health worker."
+        
+        response = ollama.chat(
+            model="mistral",
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": 0,
+                "num_predict": 150
+            }
+        )
+        return response.get("message", {}).get("content", "I recommend consulting a nearby doctor or health worker.")
+    except Exception as e:
+        print(f"[Mistral] Error: {e}")
+        return "I recommend consulting a nearby doctor or health worker."
+
+# ===== CONVERSATION HISTORY MANAGEMENT =====
+MAX_HISTORY = 6  # Limit context window to prevent Mistral from switching topics
+
+def get_limited_history(session_id: str) -> list:
+    """Get only the last MAX_HISTORY exchanges from session history."""
+    history = _SESSION_HISTORY.get(session_id, [])
+    return history[-MAX_HISTORY:]
+
+def update_history(session_id: str, user_msg: str, bot_msg: str) -> None:
+    """Add user and bot messages to history and keep only last MAX_HISTORY exchanges."""
+    if session_id not in _SESSION_HISTORY:
+        _SESSION_HISTORY[session_id] = []
+    _SESSION_HISTORY[session_id].append({"role": "user", "content": user_msg})
+    _SESSION_HISTORY[session_id].append({"role": "assistant", "content": bot_msg})
+    # Keep only last MAX_HISTORY messages
+    _SESSION_HISTORY[session_id] = _SESSION_HISTORY[session_id][-MAX_HISTORY:]
+
+# ===== NLLB-200 TRANSLATION MODEL (loaded once at startup) =====
+_NLLB_TOKENIZER = None
+_NLLB_MODEL = None
+_SESSION_LAST_RESPONSE = {}  # Store last response per session for translation
+_SUPPORTED_NLLB_LANGS = {"eng_Latn", "hin_Deva", "kan_Knda"}
+
+def _load_nllb_model():
+    """Load NLLB-200 model ONCE at startup - never on per-request."""
+    global _NLLB_TOKENIZER, _NLLB_MODEL
+    
+    if _NLLB_TOKENIZER is not None and _NLLB_MODEL is not None:
+        return _NLLB_TOKENIZER, _NLLB_MODEL
+    
+    try:
+        print("Loading NLLB-200 translation model...")
+        nllb_model_name = "facebook/nllb-200-distilled-600M"
+        _NLLB_TOKENIZER = AutoTokenizer.from_pretrained(nllb_model_name)
+        _NLLB_MODEL = AutoModelForSeq2SeqLM.from_pretrained(nllb_model_name)
+        print(f"✓ NLLB-200 model loaded successfully")
+        return _NLLB_TOKENIZER, _NLLB_MODEL
+    except Exception as e:
+        print(f"✗ Failed to load NLLB-200 model: {e}")
+        return None, None
+
+def detect_language(query: str) -> str:
+    q = str(query or "").lower()
+    if any(w in q for w in [
+            "kannada", "in kannada", "into kannada",
+            "kannada alli", "kannadadalli"]):
+        return "kan_Knda"
+    elif any(w in q for w in [
+            "hindi", "in hindi", "into hindi",
+            "hindi me", "hindi mein"]):
+        return "hin_Deva"
+    if any('\u0C80' <= c <= '\u0CFF' for c in str(query or "")):
+        return "kan_Knda"
+    if any('\u0900' <= c <= '\u097F' for c in str(query or "")):
+        return "hin_Deva"
+    return "eng_Latn"
+
+
+def is_translation_query(query: str) -> bool:
+    keywords = [
+        "translate", "in hindi", "into hindi",
+        "hindi me", "hindi mein", "in kannada",
+        "into kannada", "kannada alli", "kannadadalli"
+    ]
+    return any(k in str(query or "").lower() for k in keywords)
+
+def translate_text(text: str, src_lang: str, tgt_lang: str) -> str:
+    """Translate text using NLLB-200 model (loaded at startup) with error protection."""
+    if not text or src_lang == tgt_lang:
+        return str(text or "")
+
+    if src_lang not in _SUPPORTED_NLLB_LANGS or tgt_lang not in _SUPPORTED_NLLB_LANGS:
+        return str(text or "")
+    
+    try:
+        tokenizer, model = _load_nllb_model()
+        if tokenizer is None or model is None:
+            return text
+        
+        tokenizer.src_lang = src_lang
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        )
+        
+        translated_tokens = model.generate(
+            **inputs,
+            forced_bos_token_id=tokenizer.convert_tokens_to_ids(tgt_lang),
+            max_length=256,
+            num_beams=4,
+            length_penalty=1.0,
+            early_stopping=True
+        )
+        
+        result = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+        return result
+    except RuntimeError as e:
+        print(f"[NLLB] RuntimeError during translation: {e}")
+        return text
+    except Exception as e:
+        print(f"[NLLB] Translation error: {e}")
+        return text
+
+def enforce_language(text: str, lang: str) -> str:
+    """Remove non-native script characters to prevent mixed-language output."""
+    if lang == "kan_Knda":
+        # Keep ONLY Kannada Unicode range U+0C80–U+0CFF
+        cleaned = "".join(re.findall(r'[\u0C80-\u0CFF\s.,!?()]', text))
+        return cleaned.strip()
+    elif lang == "hin_Deva":
+        # Keep ONLY Devanagari Unicode range U+0900–U+097F
+        cleaned = "".join(re.findall(r'[\u0900-\u097F\s.,!?()]', text))
+        return cleaned.strip()
+    return text  # English - return as is
+
+
+# Eager load at startup so translation requests do not trigger runtime model initialization.
+_load_nllb_model()
+
+MONGO_URI = os.environ.get(
+    "MONGO_URI",
+    "mongodb+srv://ruralcare:rural_2026@cluster0.frguqm2.mongodb.net/"
+)
+MONGO_FALLBACK_URI = os.environ.get("MONGO_FALLBACK_URI", "mongodb://127.0.0.1:27017")
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "rural_healthcare")
+
+_mongo_client = None
+_db = None
+patients_col = None
+
+
+def _connect_mongo(force_reconnect: bool = False):
+    """Create/refresh MongoDB connection and return patients collection or None."""
+    global _mongo_client, _db, patients_col
+
+    if force_reconnect:
+        _mongo_client = None
+        _db = None
+        patients_col = None
+
+    if patients_col is not None and _mongo_client is not None:
+        try:
+            _mongo_client.admin.command("ping")
+            return patients_col
+        except Exception:
+            _mongo_client = None
+            _db = None
+            patients_col = None
+
+    def _build_client_kwargs(uri: str, allow_invalid_certs: bool = False):
+        kwargs = {
+            "serverSelectionTimeoutMS": 5000,
+            "connectTimeoutMS": 10000,
+            "socketTimeoutMS": 20000,
+            "retryWrites": True,
+        }
+
+        use_tls = str(uri).startswith("mongodb+srv://")
+
+        certifi_path = None
+        try:
+            import importlib
+            certifi_module = importlib.import_module("certifi")
+            certifi_path = certifi_module.where()
+        except Exception:
+            certifi_path = None
+
+        if use_tls and certifi_path:
+            kwargs["tls"] = True
+            kwargs["tlsCAFile"] = certifi_path
+
+        if use_tls and allow_invalid_certs:
+            kwargs["tls"] = True
+            kwargs["tlsAllowInvalidCertificates"] = True
+            kwargs.pop("tlsCAFile", None)
+
+        return kwargs
+
+    allow_invalid_env = str(os.environ.get("MONGO_TLS_ALLOW_INVALID_CERTS", "0")).lower() in {"1", "true", "yes"}
+    candidate_uris = [MONGO_URI]
+    if MONGO_FALLBACK_URI and MONGO_FALLBACK_URI not in candidate_uris:
+        candidate_uris.append(MONGO_FALLBACK_URI)
+
+    last_error = None
+    for idx, uri in enumerate(candidate_uris):
+        is_fallback = idx > 0
+        attempts = [False]
+        if str(uri).startswith("mongodb+srv://"):
+            if allow_invalid_env:
+                attempts = [True]
+            else:
+                attempts = [False, True]
+
+        for allow_invalid in attempts:
+            try:
+                _mongo_client = MongoClient(uri, **_build_client_kwargs(uri, allow_invalid))
+                _mongo_client.admin.command("ping")
+                _db = _mongo_client[MONGO_DB_NAME]
+                patients_col = _db["patients"]
+
+                if is_fallback:
+                    print(f" Connected to MongoDB fallback at {uri}")
+                elif allow_invalid:
+                    print(" Connected to MongoDB Atlas (tlsAllowInvalidCertificates enabled)")
+                else:
+                    print(" Connected to MongoDB Atlas")
+                return patients_col
+            except Exception as _mongo_err:
+                last_error = _mongo_err
+                _mongo_client = None
+                _db = None
+                patients_col = None
+
+    print(f"✗ MongoDB connection failed: {last_error}")
+    return None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_CANDIDATES = [
+    os.path.join(BASE_DIR, "disease_prediction_model.pkl"),
+    os.path.join(BASE_DIR, "model.pkl"),
+    os.path.join(BASE_DIR, "..", "Disease dataset", "disease_prediction_model.pkl"),
+]
+DISEASE_KB_PATH = os.path.join(BASE_DIR, "disease_knowledge_base.json")
+model = None
+
+
+def _load_local_disease_kb() -> dict:
+    """Load local disease knowledge base for predict-disease endpoint."""
+    try:
+        kb_path = Path(DISEASE_KB_PATH)
+        if not kb_path.exists():
+            return {}
+        with kb_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"Could not load disease knowledge base: {exc}")
+        return {}
+
+warnings.filterwarnings("ignore")
+
+RESPONSE_STYLE = "doctor-like explanation"
+STYLE_FOOTER = "Consult a doctor if symptoms persist."
+MAX_RESPONSE_TOKENS = int(os.getenv("MAX_RESPONSE_TOKENS", "120"))
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "4"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
+MAX_HISTORY_TOKENS = int(os.getenv("MAX_HISTORY_TOKENS", "1000"))
+sessions: dict[str, deque] = {}
+session_token_usage: dict[str, dict[str, int]] = {}
+_NATIVE_DISEASE_ALIASES: dict[str, dict[str, str]] = {}
+_DISEASE_KB_CACHE: dict[str, dict[str, str]] | None = None
+_DISEASE_ALIAS_CACHE: dict[str, str] | None = None
+
+def _is_medical_question(question: str) -> bool:
+    """Return True when the user is asking about a health or medical topic."""
+    raw = str(question or "")
+    q_norm = _normalize_text(question)
+    if not raw.strip() and not q_norm:
+        return False
+
+    if _detect_disease_in_question(question):
+        return True
+
+    if _detect_question_type(question):
+        return True
+
+    medical_markers = [
+        "fever",
+        "pain",
+        "cough",
+        "cold",
+        "vomit",
+        "vomiting",
+        "diarrhea",
+        "rash",
+        "headache",
+        "stomach pain",
+        "stomach ache",
+        "abdominal pain",
+        "breathing",
+        "shortness of breath",
+        "chest pain",
+        "dizziness",
+        "weakness",
+        "fatigue",
+        "infection",
+        "disease",
+        "illness",
+        "symptom",
+        "symptoms",
+        "treatment",
+        "medicine",
+        "doctor",
+        "hospital",
+        "clinic",
+        "health",
+        "medical",
+        "pregnancy",
+        "paralysis",
+        "stroke",
+        "allergy",
+        "asthma",
+        "depression",
+        "anxiety",
+        "kidney",
+        "liver",
+        "heart",
+        "skin",
+        "eye",
+        "ear",
+        "tooth",
+        "joint",
+        "blood pressure",
+        "sugar level",
+    ]
+    if any(marker in q_norm for marker in medical_markers):
+        return True
+
+    native_markers = [
+        "ಜ್ವರ",
+        "ನೋವು",
+        "ಕೆಮ್ಮು",
+        "ವಾಂತಿ",
+        "ಅತಿಸಾರ",
+        "ತಲೆನೋವು",
+        "ಉಸಿರಾಟ",
+        "ಸೋಂಕು",
+        "ರೋಗ",
+        "ವೈದ್ಯ",
+        "ಆಸ್ಪತ್ರೆ",
+        "ಚಿಕಿತ್ಸೆ",
+        "ಮದ್ದು",
+        "ಡಾಕ್ಟರ್",
+        "ಬಗ್ಗೆ",
+        "ಹೇಳಿ",
+        "ಬರಿಸಿ",
+        "ಬಿಡಿ",
+        "ಬಗ್ಗೆ ಹೇಳಿ",
+        "बुखार",
+        "दर्द",
+        "खांसी",
+        "उल्टी",
+        "दस्त",
+        "सिरदर्द",
+        "सांस",
+        "संक्रमण",
+        "रोग",
+        "डॉक्टर",
+        "अस्पताल",
+        "इलाज",
+        "दवा",
+        "बारे",
+        "बताओ",
+        "बताइए",
+        "समझाइए",
+    ]
+    if any(marker in raw for marker in native_markers):
+        return True
+
+    if _is_prevention_or_diet_question(question) or _is_followup_question(question):
+        return True
+
+    return False
+
+
+def _get_openai_client():
+    return None
+
+
+def _build_scope_system_prompt() -> str:
+    return ""
+
+
+def _build_structured_advanced_system_prompt() -> str:
+    return ""
+
+
+def _build_advanced_user_message(question: str, session_id: str | None = None) -> str:
+    return ""
+
+
+def _format_advanced_structured_reply(
+    disease: str | None,
+    kb_data: dict[str, str] | None,
+    summary_text: str,
+    target_language: str | None = None,
+) -> str:
+    return ""
+
+
+def _build_local_advanced_summary(disease: str | None, kb_data: dict[str, str] | None) -> str:
+    return ""
+
+
+def get_history(session_id: str) -> deque:
+    if session_id not in sessions:
+        sessions[session_id] = deque()
+    return sessions[session_id]
+
+
+def history_to_messages(session_id: str) -> list:
+    messages = []
+    for user_text, assistant_text in get_history(session_id):
+        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "assistant", "content": assistant_text})
+    return messages
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text or "") // 3)
+
+
+def trim_history_if_needed(session_id: str):
+    hist = get_history(session_id)
+    while hist:
+        total = sum(estimate_tokens(u) + estimate_tokens(a) for u, a in hist)
+        if total <= MAX_HISTORY_TOKENS:
+            break
+        hist.popleft()
+
+
+def add_turn(session_id: str, user_text: str, assistant_text: str):
+    hist = get_history(session_id)
+    hist.append((user_text, assistant_text))
+    while len(hist) > MAX_HISTORY_TURNS:
+        hist.popleft()
+    trim_history_if_needed(session_id)
+
+
+def _get_usage_bucket(session_id: str) -> dict[str, int]:
+    if session_id not in session_token_usage:
+        session_token_usage[session_id] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+    return session_token_usage[session_id]
+
+
+def call_general_medical_llm(session_id: str, user_query: str, short_answer: bool = False) -> dict | None:
+    return None
+
+
+def _record_token_usage(session_id: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> dict[str, int]:
+    bucket = _get_usage_bucket(session_id)
+    bucket["prompt_tokens"] += max(0, int(prompt_tokens or 0))
+    bucket["completion_tokens"] += max(0, int(completion_tokens or 0))
+    return bucket
+
+
+def _chat_response_payload(session_id: str, reply: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> dict:
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
+    totals = _record_token_usage(session_id, prompt_tokens, completion_tokens)
+    return {
+        "reply": reply,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_prompt_tokens": totals.get("prompt_tokens", 0),
+        "total_completion_tokens": totals.get("completion_tokens", 0),
+    }
+
+
+def _normalize_punctuation_artifacts(text: str) -> str:
+    """Clean common punctuation artifacts from generated/translated text."""
+    value = str(text or "").strip()
+    if not value:
+        return value
+
+    value = re.sub(r"\s+([,.;:!?])", r"\1", value)
+    value = re.sub(r"([.!?])\1+", r"\1", value)
+    value = re.sub(r"(।)\1+", r"\1", value)
+    return value.strip()
+
+
+def _apply_fixed_style(text: str) -> str:
+    """Normalize replies into concise Problem/Action/Doctor format."""
+    reply = _normalize_punctuation_artifacts(re.sub(r"\s+", " ", (text or "")).strip())
+    if not reply:
+        return reply
+
+    chunks = re.split(r"\n+|(?<=[.!?])\s+", reply)
+    sentences = []
+    for chunk in chunks:
+        clean = re.sub(r"^[\-\*•\d\)\.\s]+", "", chunk.strip())
+        clean = _normalize_punctuation_artifacts(re.sub(r"\s+", " ", clean).strip())
+        if len(clean) < 3:
+            continue
+        if clean[-1] not in ".!?":
+            clean += "."
+        sentences.append(clean)
+
+    if not sentences:
+        base = _normalize_punctuation_artifacts(reply)
+        sentences = [base if base[-1] in ".!?" else f"{base}."]
+
+    problem = _normalize_punctuation_artifacts(sentences[0])
+    what_to_do = _normalize_punctuation_artifacts(
+        sentences[1] if len(sentences) > 1 else "Take rest, drink clean fluids, and monitor symptoms."
+    )
+
+    when_to_see = "Not needed now if symptoms stay mild and improve with basic care."
+    risk_markers = [
+        "chest pain", "breath", "breathing", "unconscious", "faint", "high fever",
+        "dehydration", "severe", "blood", "confusion", "persistent", "worsen",
+    ]
+    if any(marker in reply.lower() for marker in risk_markers):
+        when_to_see = "See a doctor urgently if symptoms worsen or danger signs appear."
+    elif len(sentences) > 2:
+        when_to_see = _normalize_punctuation_artifacts(sentences[2])
+
+    return "\n".join([
+        f"- Problem: {problem}",
+        f"- What to do: {what_to_do}",
+        f"- When to see a doctor: {when_to_see}",
+        f"- {_normalize_punctuation_artifacts(STYLE_FOOTER)}",
+    ])
+
+
+def _unknown_disease_reply(candidate: str | None = None) -> str:
+    """Return a safe 1-2 line response for diseases not found in KB."""
+    disease_name = str(candidate or "This condition").strip() or "This condition"
+    if disease_name.lower() == "this condition":
+        line1 = "- This condition needs proper medical evaluation for an accurate diagnosis."
+    else:
+        line1 = f"- {disease_name} is a medical condition that needs proper clinical evaluation."
+    line2 = "- Please consult a doctor for proper guidance."
+    line3 = f"- {_normalize_punctuation_artifacts(STYLE_FOOTER)}"
+    return "\n".join([line1, line2, line3])
+
+
+def _rule_based_translate_reply(target_language: str, base_reply: str) -> str:
+    """Best-effort local translation fallback when GPT translation is unavailable."""
+    text = str(base_reply or "").strip()
+    if not text:
+        return text
+
+    def _has_latin(value: str) -> bool:
+        return bool(re.search(r"[A-Za-z]{2,}", str(value or "")))
+
+    def _extract_disease_name(value: str) -> str:
+        m = re.match(r"^\s*([A-Za-z][A-Za-z\s\-]+)\s*:", str(value or "").strip())
+        return (m.group(1).strip() if m else "")
+
+    def _localize_disease_name(disease_name: str, lang: str) -> str:
+        name = str(disease_name or "").strip().lower()
+        if not name:
+            return ""
+
+        kannada_map = {
+            "dengue": "ಡೆಂಗ್ಯೂ",
+            "malaria": "ಮಲೇರಿಯಾ",
+            "diabetes": "ಮಧುಮೇಹ",
+            "hypertension": "ಉಚ್ಚ ರಕ್ತದೊತ್ತಡ",
+            "typhoid": "ಟೈಫಾಯ್ಡ್",
+            "tuberculosis": "ಕ್ಷಯರೋಗ",
+            "pneumonia": "ನ್ಯೂಮೋನಿಯಾ",
+            "influenza": "ಇನ್ಫ್ಲೂಯೆನ್ಸಾ",
+            "common cold": "ಸಾಮಾನ್ಯ ಶೀತ",
+            "heart disease": "ಹೃದಯ ರೋಗ",
+            "asthma": "ಆಸ್ತಮಾ",
+            "gerd": "ಜಿಇಆರ್‌ಡಿ",
+            "gastritis": "ಗ್ಯಾಸ್ಟ್ರೈಟಿಸ್",
+            "food poisoning": "ಆಹಾರ ವಿಷಬಾಧೆ",
+            "appendicitis": "ಅಪೆಂಡಿಸೈಟಿಸ್",
+            "hepatitis": "ಯಕೃತ್ತಿನ ಉರಿಯೂತ",
+            "kidney stones": "ಮೂತ್ರಪಿಂಡದ ಕಲ್ಲು",
+            "urinary tract infection": "ಮೂತ್ರಮಾರ್ಗದ ಸೋಂಕು",
+            "anemia": "ರಕ್ತಹೀನತೆ",
+            "arthritis": "ಸಂಧಿವಾತ",
+            "migraine": "ಮೈಗ್ರೇನ್",
+            "allergy": "ಅಲರ್ಜಿ",
+            "chickenpox": "ಚಿಕನ್‌ಪಾಕ್ಸ್",
+            "measles": "ಮೀಸಲ್ಸ್",
+            "skin infection": "ಚರ್ಮದ ಸೋಂಕು",
+            "eczema": "ಎಕ್ಸಿಮಾ",
+            "psoriasis": "ಸೋರಿಯಾಸಿಸ್",
+            "bronchitis": "ಬ್ರಾಂಕೈಟಿಸ್",
+            "conjunctivitis": "ಕಣ್ಣು ಪೊರೆಯ ಉರಿಯೂತ",
+            "ear infection": "ಕಿವಿಯ ಸೋಂಕು",
+            "dehydration": "ದೇಹದ ನೀರಿನ ಕೊರತೆ",
+            "obesity": "ಅತಿಯಾಗಿ ತೂಕ",
+            "depression": "ಮನೋನಿರಾಶೆ",
+            "anxiety": "ಆತಂಕ",
+            "stroke": "ಸ್ಟ್ರೋಕ್",
+            "parkinson disease": "ಪಾರ್ಕಿನ್ಸನ್ ರೋಗ",
+            "alzheimer disease": "ಅಲ್ಜೈಮರ್ ರೋಗ",
+            "diarrhea": "ಜಲದೋಷ",
+        }
+        hindi_map = {
+            "dengue": "डेंगू",
+            "malaria": "मलेरिया",
+            "diabetes": "मधुमेह",
+            "hypertension": "उच्च रक्तचाप",
+            "typhoid": "टाइफाइड",
+            "tuberculosis": "क्षय रोग",
+            "pneumonia": "निमोनिया",
+            "influenza": "इन्फ्लुएंजा",
+            "common cold": "साधारण सर्दी",
+            "heart disease": "हृदय रोग",
+            "asthma": "अस्थमा",
+            "gerd": "जीईआरडी",
+            "gastritis": "गैस्ट्राइटिस",
+            "food poisoning": "खाद्य विषाक्तता",
+            "appendicitis": "अपेंडिसाइटिस",
+            "hepatitis": "हेपेटाइटिस",
+            "kidney stones": "गुर्दे की पथरी",
+            "urinary tract infection": "मूत्र मार्ग संक्रमण",
+            "anemia": "एनीमिया",
+            "arthritis": "गठिया",
+            "migraine": "माइग्रेन",
+            "allergy": "एलर्जी",
+            "chickenpox": "चेचक",
+            "measles": "खसरा",
+            "skin infection": "त्वचा संक्रमण",
+            "eczema": "एक्जिमा",
+            "psoriasis": "सोरायसिस",
+            "bronchitis": "ब्रोंकाइटिस",
+            "conjunctivitis": "कंजंक्टिवाइटिस",
+            "ear infection": "कान का संक्रमण",
+            "dehydration": "निर्जलीकरण",
+            "obesity": "मोटापा",
+            "depression": "अवसाद",
+            "anxiety": "चिंता",
+            "stroke": "स्ट्रोक",
+            "parkinson disease": "पार्किंसन रोग",
+            "alzheimer disease": "अल्जाइमर रोग",
+            "diarrhea": "दस्त",
+        }
+
+        if lang == "Kannada":
+            return kannada_map.get(name, "")
+        if lang == "Hindi":
+            return hindi_map.get(name, "")
+        return ""
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    def _extract_value(prefix: str) -> str:
+        for line in lines:
+            clean = re.sub(r"^\s*[-*]\s*", "", line)
+            if clean.lower().startswith(prefix.lower()):
+                return clean[len(prefix):].strip()
+        return ""
+
+    problem_value = _extract_value("Problem:")
+    what_to_do_value = _extract_value("What to do:")
+    when_to_see_value = _extract_value("When to see a doctor:")
+
+    def _translate_common_phrases(lang: str, value: str) -> str:
+        out = str(value or "").strip()
+        if not out:
+            return out
+
+        if lang == "Hindi":
+            replacements = [
+                # Common medical phrases
+                ("You can reduce risk by", "जोखिम कम करने के लिए"),
+                ("Drink fluids and seek medical care", "तरल पदार्थ पिएं और डॉक्टर से सलाह लें"),
+                ("See a doctor urgently if symptoms worsen", "यदि लक्षण बढ़ें तो तुरंत डॉक्टर से मिलें"),
+                ("Common symptoms include", "सामान्य लक्षण हैं"),
+                ("Caused by", "कारण है"),
+                # Single words and common terms
+                ("symptoms", "लक्षण"),
+                ("fever", "बुखार"),
+                ("cough", "खांसी"),
+                ("headache", "सिरदर्द"),
+                ("rest", "आराम"),
+                ("drink water", "पानी पिएं"),
+                ("see a doctor", "डॉक्टर से मिलें"),
+                ("medical", "चिकित्सा"),
+                ("treatment", "उपचार"),
+                # Disease-specific
+                ("dengue", "डेंगू"),
+                ("malaria", "मलेरिया"),
+                ("transmitted", "संचारित"),
+                ("transmit", "संचरण"),
+                ("mosquito", "मच्छर"),
+                ("mosquito bites", "मच्छर के काटने"),
+                ("disease", "रोग"),
+                ("viral", "वायरल"),
+                ("virus", "वायरस"),
+                # Symptoms and conditions
+                ("pain", "दर्द"),
+                ("rash", "त्वचा पर धब्बे"),
+                ("joint pain", "जोड़ों में दर्द"),
+                ("high fever", "तेज बुखार"),
+                ("fatigue", "कमजोरी"),
+                ("chills", "कंपकंपी"),
+                ("nausea", "मतली"),
+                # Actions
+                ("take", "लें"),
+                ("drink", "पिएं"),
+                ("eat", "खाएं"),
+                ("consult", "सलाह लें"),
+                ("seek care", "डॉक्टर से सलाह लें"),
+                ("apply", "लगाएं"),
+                # Time/duration
+                ("days", "दिन"),
+                ("weeks", "सप्ताह"),
+                ("months", "महीने"),
+                ("persist", "बने रहें"),
+            ]
+        elif lang == "Kannada":
+            replacements = [
+                # Common medical phrases
+                ("You can reduce risk by", "ಅಪಾಯವನ್ನು ಕಡಿಮೆ ಮಾಡಲು"),
+                ("Drink fluids and seek medical care", "ದ್ರವ ಪದಾರ್ಥಗಳನ್ನು ಕುಡಿಯಿರಿ ಮತ್ತು ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ"),
+                ("See a doctor urgently if symptoms worsen", "ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ"),
+                ("Common symptoms include", "ಸಾಮಾನ್ಯ ಲಕ್ಷಣಗಳು"),
+                ("Caused by", "ಕಾರಣ"),
+                # Single words and common terms
+                ("symptoms", "ಲಕ್ಷಣಗಳು"),
+                ("fever", "ಜ್ವರ"),
+                ("cough", "ಕಕ್ಕೆ"),
+                ("headache", "ತಲೆನೋವು"),
+                ("rest", "ವಿಶ್ರಾಂತಿ"),
+                ("drink water", "ನೀರು ಕುಡಿಯಿರಿ"),
+                ("see a doctor", "ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ"),
+                ("medical", "ವೈದ್ಯಕೀಯ"),
+                ("treatment", "ಚಿಕಿತ್ಸೆ"),
+                # Disease-specific
+                ("dengue", "ಡೆಂಗೆ"),
+                ("malaria", "ನೀರುಬಿಕ್ಕೆ"),
+                ("transmitted", "ಸಾಗಿಸಲ್ಪಡುವ"),
+                ("transmit", "ಸಾಗಿಸು"),
+                ("mosquito", "ಸೊಳ್ಳೆ"),
+                ("mosquito bites", "ಸೊಳ್ಳೆ ಕೊಚ್ಚುವುದು"),
+                ("disease", "ರೋಗ"),
+                ("viral", "ವೈರಸ್"),
+                ("virus", "ವೈರಸ್"),
+                # Symptoms and conditions
+                ("pain", "ನೋವು"),
+                ("rash", "ರೈತೆ"),
+                ("joint pain", "ಕೀಲುಗಳ ನೋವು"),
+                ("high fever", "ಹೆಚ್ಚಿನ ಜ್ವರ"),
+                ("fatigue", "ದುರ್ಬಲತೆ"),
+                ("chills", "ತುರೆದು"),
+                ("nausea", "ವಾಂತಿ"),
+                # Actions
+                ("take", "ತೆಗೆ"),
+                ("drink", "ಕುಡಿ"),
+                ("eat", "ತಿನ್ನು"),
+                ("rest", "ವಿಶ್ರಾಂತಿ"),
+                ("consult", "ಸಲಹೆ ಪಡು"),
+                ("seek care", "ಸಂಪರ್ಕಿಸು"),
+                ("apply", "ಹಾಕು"),
+                # Time/duration
+                ("days", "ದಿನಗಳು"),
+                ("weeks", "ವಾರಗಳು"),
+                ("months", "ತಿಂಗಳುಗಳು"),
+                ("persist", "ಮುಂದುವರಿದು"),
+            ]
+        else:
+            replacements = []
+
+        for src, dst in replacements:
+            out = re.sub(rf"\b{re.escape(src)}\b", dst, out, flags=re.IGNORECASE)
+        return out
+
+    if target_language == "Hindi":
+        if problem_value or what_to_do_value or when_to_see_value:
+            p = _translate_common_phrases("Hindi", problem_value) or "यह स्थिति चिकित्सकीय जांच की जरूरत रखती है।"
+            w = _translate_common_phrases("Hindi", what_to_do_value) or "साफ पानी पिएं, आराम करें, और लक्षणों पर नजर रखें।"
+            d = _translate_common_phrases("Hindi", when_to_see_value) or "लक्षण बढ़ें या गंभीर संकेत हों तो तुरंत डॉक्टर से मिलें।"
+            formatted = "\n".join([
+                f"- समस्या: {p}",
+                f"- क्या करें: {w}",
+                f"- डॉक्टर को कब दिखाएं: {d}",
+                "- लक्षण बने रहें तो डॉक्टर से सलाह लें।",
+            ])
+            if not _has_latin(formatted):
+                return formatted
+
+            disease_hint = _localize_disease_name(_extract_disease_name(problem_value), "Hindi")
+            disease_line = f"- समस्या: {disease_hint} के लक्षण हैं, सही चिकित्सकीय जांच जरूरी है।" if disease_hint else "- समस्या: यह स्थिति चिकित्सकीय जांच की जरूरत रखती है।"
+            return "\n".join([
+                disease_line,
+                "- क्या करें: आराम करें, साफ पानी पिएं, और लक्षणों पर नजर रखें।",
+                "- डॉक्टर को कब दिखाएं: लक्षण बढ़ें, तेज बुखार रहे, या सांस लेने में कठिनाई हो तो तुरंत डॉक्टर से मिलें।",
+                "- लक्षण बने रहें तो डॉक्टर से सलाह लें।",
+            ])
+
+        # If structured format not found, translate entire text using phrase replacements
+        translated_full = _translate_common_phrases("Hindi", text)
+        if translated_full and translated_full != text:
+            return translated_full
+
+        unknown = re.match(r"^-\s*(.+?)\s+is a medical condition that needs proper clinical evaluation\.?$", lines[0], re.IGNORECASE) if lines else None
+        if unknown:
+            disease = unknown.group(1).strip()
+            return "\n".join([
+                f"- {disease} एक चिकित्सा स्थिति है जिसके लिए सही चिकित्सकीय जांच जरूरी है।",
+                "- सही मार्गदर्शन के लिए डॉक्टर से सलाह लें।",
+                "- लक्षण बने रहें तो डॉक्टर से सलाह लें।",
+            ])
+
+        return "\n".join([
+            "- समस्या: यह स्थिति चिकित्सकीय जांच की जरूरत रखती है।",
+            "- क्या करें: साफ पानी पिएं, आराम करें, और लक्षणों पर नजर रखें।",
+            "- डॉक्टर को कब दिखाएं: लक्षण बढ़ें या गंभीर संकेत हों तो तुरंत डॉक्टर से मिलें।",
+            "- लक्षण बने रहें तो डॉक्टर से सलाह लें।",
+        ])
+
+    if target_language == "Kannada":
+        if problem_value or what_to_do_value or when_to_see_value:
+            p = _translate_common_phrases("Kannada", problem_value) or "ಈ ಸ್ಥಿತಿಗೆ ಸರಿಯಾದ ವೈದ್ಯಕೀಯ ಪರಿಶೀಲನೆ ಅಗತ್ಯವಿದೆ."
+            w = _translate_common_phrases("Kannada", what_to_do_value) or "ಶುದ್ಧ ನೀರು ಕುಡಿಯಿರಿ, ವಿಶ್ರಾಂತಿ ತೆಗೆದುಕೊಳ್ಳಿ, ಮತ್ತು ಲಕ್ಷಣಗಳನ್ನು ಗಮನಿಸಿ."
+            d = _translate_common_phrases("Kannada", when_to_see_value) or "ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ ಅಥವಾ ಗಂಭೀರ ಸೂಚನೆಗಳಿದ್ದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ."
+            formatted = "\n".join([
+                f"- ಸಮಸ್ಯೆ: {p}",
+                f"- ಏನು ಮಾಡಬೇಕು: {w}",
+                f"- ವೈದ್ಯರನ್ನು ಯಾವಾಗ ಭೇಟಿ ಮಾಡಬೇಕು: {d}",
+                "- ಲಕ್ಷಣಗಳು ಮುಂದುವರಿದರೆ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.",
+            ])
+            if not _has_latin(formatted):
+                return formatted
+
+            disease_hint = _localize_disease_name(_extract_disease_name(problem_value), "Kannada")
+            disease_line = f"- ಸಮಸ್ಯೆ: {disease_hint} ರೋಗದ ಲಕ್ಷಣಗಳು ಕಂಡುಬಂದಿವೆ; ಸರಿಯಾದ ವೈದ್ಯಕೀಯ ಪರಿಶೀಲನೆ ಅಗತ್ಯವಿದೆ." if disease_hint else "- ಸಮಸ್ಯೆ: ಈ ಸ್ಥಿತಿಗೆ ಸರಿಯಾದ ವೈದ್ಯಕೀಯ ಪರಿಶೀಲನೆ ಅಗತ್ಯವಿದೆ."
+            return "\n".join([
+                disease_line,
+                "- ಏನು ಮಾಡಬೇಕು: ವಿಶ್ರಾಂತಿ ತೆಗೆದುಕೊಳ್ಳಿ, ಶುದ್ಧ ನೀರು ಕುಡಿಯಿರಿ, ಮತ್ತು ಲಕ್ಷಣಗಳನ್ನು ಗಮನಿಸಿ.",
+                "- ವೈದ್ಯರನ್ನು ಯಾವಾಗ ಭೇಟಿ ಮಾಡಬೇಕು: ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ, ಹೆಚ್ಚು ಜ್ವರ ಬಂದರೆ, ಅಥವಾ ಉಸಿರಾಟ ಕಷ್ಟವಾದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ.",
+                "- ಲಕ್ಷಣಗಳು ಮುಂದುವರಿದರೆ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.",
+            ])
+
+        # If structured format not found, translate entire text using phrase replacements
+        translated_full = _translate_common_phrases("Kannada", text)
+        if translated_full and translated_full != text:
+            return translated_full
+
+        unknown = re.match(r"^-\s*(.+?)\s+is a medical condition that needs proper clinical evaluation\.?$", lines[0], re.IGNORECASE) if lines else None
+        if unknown:
+            disease = unknown.group(1).strip()
+            return "\n".join([
+                f"- {disease} ಒಂದು ವೈದ್ಯಕೀಯ ಸ್ಥಿತಿ ಆಗಿದ್ದು, ಸರಿಯಾದ ಕ್ಲಿನಿಕಲ್ ಪರೀಕ್ಷೆ ಅಗತ್ಯವಿದೆ.",
+                "- ಸರಿಯಾದ ಮಾರ್ಗದರ್ಶನಕ್ಕಾಗಿ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.",
+                "- ಲಕ್ಷಣಗಳು ಮುಂದುವರಿದರೆ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.",
+            ])
+
+        return "\n".join([
+            "- ಸಮಸ್ಯೆ: ಈ ಸ್ಥಿತಿಗೆ ಸರಿಯಾದ ವೈದ್ಯಕೀಯ ಪರಿಶೀಲನೆ ಅಗತ್ಯವಿದೆ.",
+            "- ಏನು ಮಾಡಬೇಕು: ಶುದ್ಧ ನೀರು ಕುಡಿಯಿರಿ, ವಿಶ್ರಾಂತಿ ತೆಗೆದುಕೊಳ್ಳಿ, ಮತ್ತು ಲಕ್ಷಣಗಳನ್ನು ಗಮನಿಸಿ.",
+            "- ವೈದ್ಯರನ್ನು ಯಾವಾಗ ಭೇಟಿ ಮಾಡಬೇಕು: ಲಕ್ಷಣಗಳು ಹೆಚ್ಚಾದರೆ ಅಥವಾ ಗಂಭೀರ ಸೂಚನೆಗಳಿದ್ದರೆ ತಕ್ಷಣ ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ.",
+            "- ಲಕ್ಷಣಗಳು ಮುಂದುವರಿದರೆ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.",
+        ])
+
+    return text
+
+
+def _rewrite_query_for_kb(session_id: str, question: str) -> dict | None:
+    return None
+
+
+def _extract_target_language(question: str) -> str | None:
+    """Detect whether user requested a translated answer language."""
+    raw = str(question or "")
+    q = _normalize_text(raw)
+    raw_lower = raw.lower()
+
+    # Native-script detection first so same-language replies work without explicit 'translate'.
+    if re.search(r"[\u0C80-\u0CFF]", raw):
+        return "Kannada"
+    if re.search(r"[\u0900-\u097F]", raw):
+        return "Hindi"
+
+    if "ಕನ್ನಡ" in raw_lower or any(marker in q for marker in ["kannada", "kannada dalli", "kannada nalli", "in kannada"]):
+        return "Kannada"
+
+    if "हिंदी" in raw or any(marker in q for marker in ["hindi", "hindi me", "hindime", "in hindi"]):
+        return "Hindi"
+
+    return None
+
+
+def _translate_reply_if_needed(session_id: str, message: str, base_reply: str, short_answer: bool = False) -> dict | None:
+    """Translate reply into requested target language when user asks for it."""
+    target_language = _extract_target_language(message)
+    if not target_language:
+        return None
+
+    # Use ONLY rule-based translation for Kannada/Hindi - LLM produces garbled mixed-language output
+    # Rule-based is more reliable for complete language switching
+    fallback_reply = _rule_based_translate_reply(target_language, base_reply)
+    
+    if fallback_reply:
+        add_turn(session_id, message, fallback_reply)
+        return {
+            "reply": fallback_reply,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    # If rule-based translation failed completely, return None (user gets English)
+    return None
+
+
+def _get_last_assistant_reply(session_id: str) -> str:
+    """Return the most recent assistant response from session history."""
+    hist = get_history(session_id)
+    if not hist:
+        return ""
+    _last_user, last_assistant = hist[-1]
+    return str(last_assistant or "").strip()
+
+
+def call_llm(session_id: str, user_query: str, short_answer: bool = False) -> dict | None:
+    return None
+
+
+def call_llm_advanced(
+    session_id: str,
+    user_query: str,
+    target_language: str | None = None,
+    short_answer: bool = False,
+) -> dict | None:
+    return None
+
+
+def call_llm_transform(session_id: str, user_query: str, source_answer: str, short_answer: bool = False) -> dict | None:
+    return None
+
+
+def _is_transform_request(question: str) -> bool:
+    """Detect prompt types that ask to reformat/translate/summarize previous answer."""
+    q = _normalize_text(question)
+    if not q:
+        return False
+
+    markers = [
+        "previous answer",
+        "previous response",
+        "last answer",
+        "last response",
+        "translate",
+        "explain more",
+        "explain simply",
+        "simplify",
+        "beginner",
+        "bullet point",
+        "table format",
+        "checklist",
+        "step by step",
+        "same advice",
+        "script",
+        "summarize",
+        "simple english",
+        "10 year old",
+        "follow up triage questions",
+    ]
+
+    return any(marker in q for marker in markers)
+
+
+def _wants_short_answer(question: str) -> bool:
+    """Detect when user explicitly asks for concise output."""
+    q = _normalize_text(question)
+    short_markers = [
+        "short answer",
+        "small answer",
+        "brief",
+        "in short",
+        "shortly",
+        "one line",
+        "few words",
+    ]
+    return any(marker in q for marker in short_markers)
+
+
+def _is_advanced_question(question: str) -> bool:
+    return False
+
+
+def _shorten_answer(answer: str, max_chars: int = 280) -> str:
+    """Trim verbose responses for concise mode."""
+    text = re.sub(r"\s+", " ", (answer or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rsplit(" ", 1)[0].strip()
+    return f"{clipped}..."
+
+_DISEASE_KB: dict[str, dict[str, str]] = {}
+_DISEASE_ALIASES: dict[str, str] = {}
+
+
+_llm_pipeline = None
+_LLM_MODEL = "distilgpt2"
+
+def _get_llm():
+    """Lazy-load the distilgpt2 text-generation pipeline."""
+    global _llm_pipeline
+    if _llm_pipeline is not None:
+        return _llm_pipeline
+    try:
+        from transformers import pipeline
+        print(f"Loading LLM ({_LLM_MODEL}) …")
+        _llm_pipeline = pipeline(
+            "text-generation",
+            model=_LLM_MODEL,
+            max_new_tokens=80,
+            do_sample=False,        
+            truncation=True,
+        )
+        print(f"✓ LLM loaded ({_LLM_MODEL})")
+    except Exception as e:
+        print(f"LLM unavailable: {e}")
+        _llm_pipeline = None
+    return _llm_pipeline
+
+
+def generate_advice(disease: str, symptoms: list) -> str:
+    """Return concise, deterministic advice for a diagnosed disease.
+
+    The previous generative fallback could produce hallucinated or repetitive
+    output for some diseases, so the final advice now prefers curated KB text
+    and a small rule-based fallback only.
+    """
+    kb_advice = _kb_advice_for_disease(disease)
+    if kb_advice:
+        return _shorten_answer(kb_advice, max_chars=180)
+
+    return _shorten_answer(_fallback_advice(disease), max_chars=180)
+
+
+def _fallback_advice(disease: str) -> str:
+    """Rule-based fallback when LLM is unavailable."""
+    # Prefer disease-specific guidance from the curated knowledge base.
+    kb_advice = _kb_advice_for_disease(disease)
+    if kb_advice:
+        return kb_advice
+
+    disease_lower = disease.lower()
+    if any(k in disease_lower for k in ["diabetes", "sugar"]):
+        return ("Monitor blood sugar levels regularly, follow a low-sugar diet, "
+                "stay hydrated, and consult a doctor for medication guidance.")
+    if any(k in disease_lower for k in ["hypertension", "blood pressure"]):
+        return ("Reduce salt intake, avoid stress, exercise gently, "
+                "and take prescribed medication consistently.")
+    if any(k in disease_lower for k in ["malaria", "fever"]):
+        return ("Rest, drink plenty of fluids, take prescribed antimalarials or "
+                "antipyretics, and seek clinic care if fever persists beyond 2 days.")
+    if any(k in disease_lower for k in ["pneumonia", "respiratory", "cough"]):
+        return ("Rest, keep warm, drink warm fluids, and complete the full course "
+                "of any prescribed antibiotics. Visit a health facility if breathing worsens.")
+    disease_clean = str(disease).strip()
+    if disease_clean and disease_clean.lower() not in {"unknown", "unknown condition", "not available"}:
+        return (
+            f"For {disease_clean}, follow prescribed treatment, rest well, stay hydrated, "
+            "eat nutritious food, and consult the nearest health facility if symptoms worsen "
+            "or do not improve in 48 hours."
+        )
+
+    return ("Rest well, stay hydrated, eat nutritious food, and consult "
+            "the nearest health facility if symptoms worsen or do not improve in 48 hours.")
+
+
+def _kb_advice_for_disease(disease: str) -> str | None:
+    kb = _load_disease_kb()
+    if not kb:
+        return None
+
+    disease_name = _detect_disease_in_question(disease) or str(disease or "").strip()
+    if not disease_name:
+        return None
+
+    record = kb.get(disease_name)
+    if not isinstance(record, dict):
+        return None
+
+    preferred_fields = [
+        "How to control it?",
+        "When to see a doctor?",
+        "Prevention",
+        "What should a patient do if they have this disease?",
+        "What are the symptoms?",
+        "What is the disease?",
+    ]
+
+    for field in preferred_fields:
+        value = str(record.get(field, "")).strip()
+        if not value:
+            continue
+        if field == "What are the symptoms?":
+            return f"Common symptoms include {value}."
+        return value if value[-1] in ".!?" else f"{value}."
+
+    return None
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+def detect_input_language(text: str) -> str:
+    """Detect whether text is Kannada, Hindi (Devanagari), or English.
+
+    Rules (deterministic):
+    - If text contains characters in the Kannada Unicode block (U+0C80–U+0CFF) => 'kannada'
+    - If text contains characters in the Devanagari block (U+0900–U+097F) => 'hindi'
+    - If certain language-indicator phrases are present like 'in kannada', 'kannada mein', 'हिंदी में' => override
+    - Default => 'english'
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "english"
+
+    s = str(text)
+    # Phrase indicators (case-insensitive)
+    lower = s.lower()
+    if any(p in lower for p in ("in kannada", "kannada mein", "kannada me", "kannadadalli", "in kannad", "kannada:")):
+        return "kannada"
+    if any(p in lower for p in ("in hindi", "hindi mein", "hindi me", "hindi:", "hindI mein")):
+        return "hindi"
+
+    # Unicode block checks
+    # Kannada: \u0C80 - \u0CFF
+    if re.search(r"[\u0C80-\u0CFF]", s):
+        return "kannada"
+    # Devanagari (Hindi): \u0900 - \u097F
+    if re.search(r"[\u0900-\u097F]", s):
+        return "hindi"
+
+    return "english"
+
+
+# Deterministic phrase maps for Kannada and Hindi used when we must NOT call the LLM
+TRANSLATIONS_KANNADA: dict[str, str] = {
+    "- Problem:": "- ಸಮಸ್ಯೆ:",
+    "- What to do:": "- ಮಾಡಬೇಕಾದದ್ದು:",
+    "- When to see a doctor:": "- ವೈದ್ಯರನ್ನುいつ ನೋಡಬೇಕು:",
+    "Consult a doctor if symptoms persist.": "ಲಕ್ಷಣಗಳು ಮುಂದುವರಿದರೆ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.",
+    "Information is currently limited.": "ಈಗಾಗಲೇ ಮಾಹಿತಿಯನ್ನು ಹೊಂದಿಲ್ಲ.",
+}
+
+TRANSLATIONS_HINDI: dict[str, str] = {
+    "- Problem:": "- समस्या:",
+    "- What to do:": "- क्या करना चाहिए:",
+    "- When to see a doctor:": "- डॉक्टर को कब देखें:",
+    "Consult a doctor if symptoms persist.": "यदि लक्षण बने रहें तो डॉक्टर से परामर्श लें।",
+    "Information is currently limited.": "वर्तमान में जानकारी सीमित है।",
+}
+
+
+def translate_answer(answer: str, lang: str) -> str:
+    """Deterministically translate known phrases in `answer` to `lang` if supported.
+
+    This intentionally does not call any external LLMs and only substitutes fixed phrases.
+    """
+    if not answer or lang == "english":
+        return answer
+
+    mapping = TRANSLATIONS_KANNADA if lang == "kannada" else TRANSLATIONS_HINDI if lang == "hindi" else {}
+    out = str(answer)
+    for eng, trans in mapping.items():
+        out = out.replace(eng, trans)
+    return out
+
+
+def detect_intent(query: str) -> str:
+    """Detect intent from the user's query using simple keyword rules.
+
+    Rules (case-insensitive):
+    - If query contains "what is" -> "definition"
+    - If query contains "symptom" -> "symptoms"
+    - If query contains "cause" -> "causes"
+    - If query contains "treatment" or "what to do" -> "treatment"
+    - If query contains "prevention" -> "prevention"
+    - Otherwise -> "general"
+    """
+    if not isinstance(query, str) or not query.strip():
+        return "general"
+    q = query.lower()
+    if "what is" in q:
+        return "definition"
+    if "symptom" in q:
+        return "symptoms"
+    if "cause" in q:
+        return "causes"
+    if "treatment" in q or "what to do" in q:
+        return "treatment"
+    if "prevention" in q:
+        return "prevention"
+    return "general"
+
+
+def get_context_by_intent(disease_data: dict, intent: str) -> str:
+    """Select a single context string from a disease KB record based on intent.
+
+    Mapping:
+    - definition -> "What is the disease?"
+    - symptoms -> "What are the symptoms?"
+    - causes -> "What causes the disease?"
+    - treatment -> "What should a patient do if they have this disease?"
+    - prevention -> "Prevention"
+    - general -> "combined_text"
+    """
+    if not isinstance(disease_data, dict):
+        return ""
+    mapping = {
+        "definition": "What is the disease?",
+        "symptoms": "What are the symptoms?",
+        "causes": "What causes the disease?",
+        "treatment": "What should a patient do if they have this disease?",
+        "prevention": "Prevention",
+        "general": "combined_text",
+    }
+    key = mapping.get(intent, "combined_text")
+    value = disease_data.get(key, "") if isinstance(disease_data, dict) else ""
+    return str(value or "").strip()
+
+
+BAD_PHRASES = [
+    "i don't know", "i'm not sure",
+    "as an ai", "i cannot", "i am not able"
+]
+
+
+def build_mistral_prompt(current_disease: str | None, user_input: str) -> str:
+    if current_disease:
+        return f"""You are a rural healthcare assistant in India.
+Answer ONLY about {current_disease}.
+Do NOT mention any other disease.
+Be concise, factual, under 3 sentences.
+Use simple English suitable for rural users.
+If unsure say: I recommend consulting a nearby doctor.
+Never make up symptoms, medicines or treatments.
+For emergency diseases end with: Please visit a doctor immediately.
+User question: {user_input}"""
+    return f"""You are a rural healthcare assistant in India.
+Answer only health related questions.
+Be concise, factual, under 3 sentences.
+Use simple English suitable for rural users.
+User question: {user_input}"""
+
+
+def _call_simple_llm(session_id: str | None, user_query: str, filtered_context: str, short_answer: bool = True) -> str:
+    """Simple LLM caller that passes only the filtered context to the local LLM pipeline.
+
+    If the local transformer pipeline is unavailable, produce a concise fallback using the
+    provided context (or a short KB-style reply).
+    Returns a short string reply (2-3 lines recommended by prompt).
+    """
+    if is_translation_query(user_query):
+        return "Translation is handled separately."
+
+    # Get limited conversation history (only last MAX_HISTORY exchanges) to prevent Mistral confusion
+    session_key = str(session_id) if session_id else "default"
+    recent_history = get_limited_history(session_key)
+    current_disease = _get_session_disease(session_key)
+    
+    # Build prompt with limited context history
+    history_text = ""
+    if recent_history:
+        history_text = "Recent conversation:\n"
+        for msg in recent_history:
+            role = msg.get("role", "user").capitalize()
+            content = msg.get("content", "")[:200]  # Truncate long history entries
+            history_text += f"{role}: {content}\n"
+        history_text += "\n"
+    
+    prompt = build_mistral_prompt(current_disease, user_query)
+    if filtered_context:
+        prompt = f"{prompt}\n\nContext:\n{filtered_context}"
+    if history_text:
+        prompt = f"{history_text}{prompt}"
+
+    # Try Ollama first (if installed and running)
+    try:
+        try:
+            import ollama
+        except Exception:
+            ollama = None
+
+        if ollama is not None:
+            try:
+                response = ollama.generate(
+                    model="mistral",
+                    prompt=prompt,
+                    stream=False,
+                    options={
+                        "temperature": float(os.getenv("OLLAMA_TEMPERATURE", "0")),
+                        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "150")),
+                        "top_p": float(os.getenv("OLLAMA_TOP_P", "0.9")),
+                    },
+                )
+                generated_text = response.get("response", "") or response.get("generated_text", "")
+                generated = str(generated_text).strip()
+                if any(p in generated.lower() for p in BAD_PHRASES):
+                    generated = "I recommend consulting a nearby doctor or health worker."
+                # Keep only first 2-3 sentences
+                sentences = re.split(r'(?<=[.!?])\s+', generated)
+                reply = " ".join(sentences[:3]).strip() if sentences else generated
+                if len(reply) > 600:
+                    reply = reply[:597].rsplit(" ", 1)[0] + "..."
+                return reply
+            except Exception as e:
+                print(f"Ollama generate error: {e}")
+
+        # Fall back to local transformer pipeline
+        llm = _get_llm()
+        if llm is None:
+            # Fallback: derive a short reply from filtered_context or a rule-based summary
+            if filtered_context:
+                text = re.sub(r"\s+", " ", filtered_context).strip()
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                summary = " ".join(sentences[:2]) if sentences and len(sentences) > 0 else text
+                if len(summary) > 280:
+                    summary = summary[:277].rsplit(" ", 1)[0] + "..."
+                return summary
+            # If no context, return a generic safe message
+            return "I don't have specifics on that. Please consult a healthcare provider for details."
+
+        try:
+            outputs = llm(prompt, max_new_tokens=120, do_sample=False)
+            full = outputs[0].get("generated_text", "")
+            if full.startswith(prompt):
+                generated = full[len(prompt):].strip()
+            else:
+                generated = full
+            sentences = re.split(r'(?<=[.!?])\s+', generated)
+            reply = " ".join(sentences[:3]).strip() if sentences else generated.strip()
+            if len(reply) > 600:
+                reply = reply[:597].rsplit(" ", 1)[0] + "..."
+            return reply
+        except Exception as e:
+            print(f"LLM pipeline error: {e}")
+            if filtered_context:
+                return (filtered_context.split(". ")[:2] and " ".join(filtered_context.split(". ")[:2])) or filtered_context
+            return "I don't have details for that condition; please consult a healthcare professional."
+    except Exception as e:
+        print(f"_call_simple_llm unexpected error: {e}")
+        if filtered_context:
+            return filtered_context.split('\n')[0][:300]
+        return "I don't have details for that condition; please consult a healthcare professional."
+
+
+def _load_disease_kb() -> dict[str, dict[str, str]]:
+    global _DISEASE_KB_CACHE
+    if _DISEASE_KB_CACHE is not None:
+        return _DISEASE_KB_CACHE
+
+    try:
+        with open(DISEASE_KB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _DISEASE_KB_CACHE = data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"KB load warning: {exc}")
+        _DISEASE_KB_CACHE = {}
+
+    return _DISEASE_KB_CACHE
+
+
+def _build_disease_aliases(kb: dict[str, dict[str, str]]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for disease in kb.keys():
+        disease_name = str(disease or "").strip()
+        if not disease_name:
+            continue
+
+        aliases[_normalize_text(disease_name)] = disease_name
+        aliases[_normalize_text(f"what is {disease_name}")] = disease_name
+        aliases[_normalize_text(f"what are {disease_name}")] = disease_name
+
+    aliases.update({
+        "dengue fever": "Dengue",
+        "high blood pressure": "Hypertension",
+        "blood pressure": "Hypertension",
+        "diabetes mellitus": "Diabetes",
+        "sugar disease": "Diabetes",
+    })
+    return aliases
+
+
+def _extract_disease_candidate(question: str) -> str | None:
+    """Extract probable disease phrase from user question text."""
+    q_norm = _normalize_text(question)
+    if not q_norm:
+        return None
+
+    patterns = [
+        r"(?:what is|what are)\s+([a-z0-9\s]+)",
+        r"(?:symptoms|signs|cause|causes|treatment|cure|medicine|management)\s+(?:of|for)\s+([a-z0-9\s]+)",
+        r"(?:about)\s+([a-z0-9\s]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, q_norm)
+        if not match:
+            continue
+
+        candidate = match.group(1).strip()
+        candidate = re.sub(r"\b(the|disease|illness|problem|condition)\b", "", candidate)
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if candidate:
+            return candidate
+
+    return None
+
+
+def _detect_disease_in_question(question: str) -> str | None:
+    q_norm = _normalize_text(question)
+    if not q_norm:
+        return None
+
+    kb = _load_disease_kb()
+    global _DISEASE_ALIAS_CACHE
+    if _DISEASE_ALIAS_CACHE is None:
+        _DISEASE_ALIAS_CACHE = _build_disease_aliases(kb)
+
+    # 1) Try to extract an explicit candidate phrase from the question
+    candidate = _extract_disease_candidate(question)
+    if candidate:
+        candidate_norm = _normalize_text(candidate)
+        # exact alias match
+        if candidate_norm in _DISEASE_ALIAS_CACHE:
+            detected = _DISEASE_ALIAS_CACHE[candidate_norm]
+            print(f"[detect] Exact alias match: '{detected}' for candidate '{candidate}'")
+            return detected
+        # exact disease name match
+        for disease in kb.keys():
+            if candidate_norm == _normalize_text(disease):
+                print(f"[detect] Exact disease name match: '{disease}' for candidate '{candidate}'")
+                return disease
+        # close match using difflib for minor spelling mistakes
+        alias_keys = list(_DISEASE_ALIAS_CACHE.keys())
+        close = difflib.get_close_matches(candidate_norm, alias_keys, n=1, cutoff=0.75)
+        if close:
+            detected = _DISEASE_ALIAS_CACHE.get(close[0])
+            print(f"[detect] Close alias match: '{detected}' (matched '{close[0]}') for candidate '{candidate}'")
+            return detected
+
+    # 2) Partial matching in the full question (e.g., 'i have dengue fever')
+    for disease in kb.keys():
+        disease_norm = _normalize_text(disease)
+        if disease_norm and (disease_norm in q_norm or q_norm in disease_norm):
+            print(f"[detect] Partial match: '{disease}' found in question")
+            return disease
+
+    # 3) Alias substring matching
+    for alias, disease in _DISEASE_ALIAS_CACHE.items():
+        if alias and (alias in q_norm or q_norm in alias):
+            print(f"[detect] Alias substring match: alias '{alias}' -> disease '{disease}'")
+            return disease
+
+    # 4) Final close-match over disease names for fuzzy matching
+    disease_keys_norm = [_normalize_text(d) for d in kb.keys()]
+    close2 = difflib.get_close_matches(q_norm, disease_keys_norm, n=1, cutoff=0.75)
+    if close2:
+        # map normalized key back to original disease name
+        match_norm = close2[0]
+        for d in kb.keys():
+            if _normalize_text(d) == match_norm:
+                print(f"[detect] Final close disease match: '{d}' (matched '{match_norm}')")
+                return d
+
+    # No disease detected
+    return None
+
+
+def _detect_question_type(question: str) -> str | None:
+    """Infer which standard disease Q/A field the user is asking for."""
+    q = _normalize_text(question)
+    if not q:
+        return None
+
+    should_do_markers = [
+        "what should", "what to do", "what do i do", "what should i do", "treatment",
+        "manage", "management", "care", "medicine", "remedy", "how can i recover",
+    ]
+    symptoms_markers = ["symptom", "sign", "indication", "how does it feel"]
+    early_stage_markers = [
+        "early stage", "early symptom", "initial symptom", "first symptom", "starting symptom",
+        "beginning symptom", "starting stage", "first stage",
+    ]
+    effects_markers = ["affect", "effect", "impact", "complication", "complications", "dangerous"]
+    prevention_markers = ["prevent", "prevention", "precaution", "avoid", "reduce risk"]
+    nutrition_markers = ["food", "foods", "eat", "eating", "diet", "consume", "meal", "meals", "nutrition", "nutritional"]
+    exercise_markers = ["exercise", "workout", "physical activity", "yoga", "walk", "walking"]
+    causes_markers = ["cause", "causes", "why", "reason", "how do you get"]
+    stages_markers = ["stage", "stages", "level", "how bad", "how serious", "grade"]
+    emergency_signs_markers = [
+        "emergency",
+        "very emergency",
+        "very serious",
+        "critical",
+        "life threatening",
+        "emergency sign",
+        "danger sign",
+        "when is it dangerous",
+    ]
+    what_is_markers = ["what is", "what is the disease", "define", "about", "explain"]
+
+    if any(marker in q for marker in early_stage_markers):
+        return "Early Stage Symptoms"
+    if any(marker in q for marker in should_do_markers):
+        return "What should a patient do if they have this disease?"
+    if any(marker in q for marker in symptoms_markers):
+        return "What are the symptoms?"
+    if any(marker in q for marker in effects_markers):
+        return "What are the symptoms?"
+    if any(marker in q for marker in prevention_markers):
+        return "Prevention"
+    if any(marker in q for marker in nutrition_markers):
+        return "Food"
+    if any(marker in q for marker in exercise_markers):
+        return "Exercise"
+    if any(marker in q for marker in causes_markers):
+        return "What causes the disease?"
+    if any(marker in q for marker in stages_markers):
+        return "Stages"
+    if any(marker in q for marker in emergency_signs_markers):
+        return "Emergency signs"
+    if any(marker in q for marker in what_is_markers):
+        return "What is the disease?"
+    return None
+
+
+def _is_prevention_or_diet_question(question: str) -> bool:
+    """Detect if question is specifically about prevention or diet (not general 'what to do')."""
+    q = _normalize_text(question)
+    prevention_markers = ["prevent", "prevention", "precaution", "avoid", "how to avoid", "reduce risk"]
+    diet_markers = ["food", "foods", "eat", "eating", "diet", "consume", "meal", "meals", "nutrition", "nutritional", "what to eat", "what can i eat"]
+    return any(marker in q for marker in prevention_markers) or any(marker in q for marker in diet_markers)
+
+
+VAGUE_FOLLOWUPS = [
+    "it",
+    "this",
+    "that",
+    "this disease",
+    "that disease",
+    "how it",
+    "how will it",
+    "will it",
+    "is it",
+    "can it",
+    "does it",
+    "what about",
+    "during this",
+    "during it",
+    "for this",
+    "for it",
+    "avoid it",
+    "food",
+    "foods",
+    "eat",
+    "diet",
+    "consume",
+    "stage",
+    "stages",
+    "level",
+    "grade",
+    "how bad",
+    "how serious",
+    "emergency",
+    "critical",
+    "life threatening",
+    "danger sign",
+]
+
+
+def _is_followup_question(question: str) -> bool:
+    """Detect brief follow-up prompts that rely on previous disease context."""
+    q = _normalize_text(question)
+    if not q:
+        return False
+
+    if len(q.split()) <= 14 and any(marker in q for marker in VAGUE_FOLLOWUPS):
+        return True
+
+    return False
+
+
+def _infer_recent_disease_from_session(session_id: str) -> str | None:
+    """Infer the most recently discussed disease from the current session history."""
+    if not session_id:
+        return None
+
+    # First, check session-level cached disease with TTL (if present)
+    try:
+        remembered = _get_session_disease(session_id)
+        if remembered:
+            print(f"[session] Using remembered disease '{remembered}' for session {session_id}")
+            return remembered
+    except Exception:
+        pass
+
+    # Fallback: scan recent chat history for explicit disease mentions
+    hist = list(get_history(session_id))
+    if not hist:
+        return None
+
+    for user_text, _assistant_text in reversed(hist):
+        disease = _detect_disease_in_question(user_text)
+        if disease:
+            return disease
+    return None
+
+
+def _build_kb_style_answer(disease: str, qa: dict[str, str], question_type: str | None = None) -> str:
+    """Compose a high-quality fixed-format answer from KB fields."""
+    disease_name = str(disease or "").strip() or "This condition"
+    about = str(qa.get("What is the disease?", "")).strip()
+    symptoms = str(qa.get("What are the symptoms?", "")).strip()
+    causes = str(qa.get("What causes the disease?", "")).strip()
+    early_stage = str(qa.get("Early Stage Symptoms", "")).strip()
+    prevention = str(qa.get("Prevention", "")).strip()
+    food = str(qa.get("Food", "")).strip()
+    exercise = str(qa.get("Exercise", "")).strip()
+    stages = str(qa.get("Stages", "")).strip()
+    emergency_signs = str(qa.get("Emergency signs", "")).strip()
+    advice = str(qa.get("What should a patient do if they have this disease?", "")).strip()
+
+    if not advice:
+        advice = "Rest, stay hydrated, and follow guidance from a qualified healthcare provider."
+
+    if question_type == "What are the symptoms?":
+        problem = f"{disease_name}: {symptoms}" if symptoms else f"{disease_name}: Symptoms information is currently limited."
+    elif question_type == "Early Stage Symptoms":
+        problem = (
+            f"{disease_name}: Early stage symptoms include {early_stage}"
+            if early_stage else
+            f"{disease_name}: Early stage symptom information is currently limited."
+        )
+        if not advice:
+            advice = "Monitor symptoms closely, rest, and consult a doctor if symptoms get worse."
+    elif question_type == "Prevention":
+        problem = (
+            f"{disease_name}: You can reduce risk by {prevention}"
+            if prevention else
+            f"{disease_name}: Prevention information is currently limited."
+        )
+        if not advice:
+            advice = "Follow hygiene, avoid known triggers, and consult a doctor for personal prevention advice."
+    elif question_type == "Food":
+        problem = (
+            f"{disease_name}: Recommended food guidance is {food}"
+            if food else
+            f"{disease_name}: Food guidance is currently limited."
+        )
+        if not advice:
+            advice = "Take light, balanced meals and stay hydrated unless your doctor advised otherwise."
+    elif question_type == "Exercise":
+        problem = (
+            f"{disease_name}: Exercise guidance is {exercise}"
+            if exercise else
+            f"{disease_name}: Exercise guidance is currently limited."
+        )
+        if not advice:
+            advice = "Do only gentle activity and stop if symptoms worsen."
+    elif question_type == "Stages":
+        problem = (
+            f"Stages of {disease_name}: {stages}"
+            if stages else
+            f"{disease_name}: Stage information is currently limited."
+        )
+        if not advice:
+            advice = "Get medical staging through proper tests and follow specialist treatment plans."
+    elif question_type == "Emergency signs":
+        problem = (
+            f"Emergency warning signs of {disease_name}: {emergency_signs}"
+            if emergency_signs else
+            f"{disease_name}: Emergency sign information is currently limited."
+        )
+        if not advice:
+            advice = "If danger signs appear, seek emergency hospital care immediately."
+    elif question_type == "What causes the disease?":
+        if causes and symptoms:
+            problem = f"{disease_name}: Caused by {causes} Common symptoms include {symptoms}"
+        elif causes:
+            problem = f"{disease_name}: Caused by {causes}"
+        else:
+            problem = f"{disease_name}: Cause information is currently limited."
+    elif question_type == "What is the disease?":
+        if about and symptoms:
+            problem = f"{disease_name}: {about} Common symptoms include {symptoms}"
+        elif about:
+            problem = f"{disease_name}: {about}"
+        elif symptoms:
+            problem = f"{disease_name}: Common symptoms include {symptoms}"
+        else:
+            problem = f"{disease_name}: Information is currently limited."
+    else:
+        if symptoms and causes:
+            problem = f"{disease_name}: Symptoms include {symptoms} Main cause: {causes}"
+        elif symptoms:
+            problem = f"{disease_name}: Symptoms include {symptoms}"
+        elif about:
+            problem = f"{disease_name}: {about}"
+        else:
+            problem = f"{disease_name}: Information is currently limited."
+
+    when_to_see = (
+        "See a doctor urgently if symptoms worsen, breathing becomes difficult, "
+        "high fever persists, or there are danger signs like chest pain or dehydration."
+    )
+
+    problem = _normalize_punctuation_artifacts(re.sub(r"\s+", " ", problem).strip())
+    advice = _normalize_punctuation_artifacts(re.sub(r"\s+", " ", advice).strip())
+    when_to_see = _normalize_punctuation_artifacts(re.sub(r"\s+", " ", when_to_see).strip())
+
+    if problem and problem[-1] not in ".!?":
+        problem += "."
+    if advice and advice[-1] not in ".!?":
+        advice += "."
+    if when_to_see and when_to_see[-1] not in ".!?":
+        when_to_see += "."
+
+    return "\n".join([
+        f"- Problem: {problem}",
+        f"- What to do: {advice}",
+        f"- When to see a doctor: {when_to_see}",
+        f"- {_normalize_punctuation_artifacts(STYLE_FOOTER)}",
+    ])
+
+
+def _disease_kb_answer(
+    question: str,
+    session_id: str | None = None,
+    enable_openai_enrichment: bool = False,
+) -> str | None:
+    del enable_openai_enrichment
+
+    if not isinstance(question, str) or not question.strip():
+        return None
+
+    kb = _load_disease_kb()
+    if not kb:
+        return None
+
+    # Try to detect disease from the question or recent session
+    disease = _detect_disease_in_question(question)
+    if disease is None and session_id:
+        disease = _infer_recent_disease_from_session(session_id)
+
+    # If disease found, use intent-based field selection and ask LLM only that field
+    if disease:
+        qa = kb.get(disease)
+        if not isinstance(qa, dict):
+            return None
+
+        intent = detect_intent(question)
+        filtered_context = get_context_by_intent(qa, intent)
+
+        # If selected field is empty, fall back to combined_text or the KB-style answer
+        if not filtered_context:
+            filtered_context = str(qa.get("combined_text", "") or "").strip()
+
+        # If still empty, return the structured KB answer (best effort)
+        if not filtered_context:
+            answer = _build_kb_style_answer(disease, qa, _detect_question_type(question))
+            if _is_incomplete_kb_answer(answer):
+                return None
+            return answer
+
+        # Call LLM with only the filtered context (do NOT pass the entire disease object)
+        try:
+            reply = _call_simple_llm(session_id, question, filtered_context, short_answer=True)
+            reply = _apply_fixed_style(reply)
+            if reply and not _is_incomplete_kb_answer(reply):
+                return reply
+        except Exception:
+            pass
+
+        # Final fallback: return KB-style composed answer
+        answer = _build_kb_style_answer(disease, qa, _detect_question_type(question))
+        if _is_incomplete_kb_answer(answer):
+            return None
+        return answer
+
+    # If no disease detected, ask LLM to generate a short, general explanation
+    try:
+        general_reply = _call_simple_llm(session_id, question, "", short_answer=True)
+        general_reply = _apply_fixed_style(general_reply)
+        if general_reply:
+            return general_reply
+    except Exception:
+        pass
+
+    # If all else fails, return an unknown-disease safe reply
+    return _unknown_disease_reply(None)
+
+
+def _is_incomplete_kb_answer(answer: str) -> bool:
+    text = _normalize_text(answer)
+    if not text:
+        return True
+    return any(marker in text for marker in [
+        "information is currently limited",
+        "currently limited",
+        "unable to identify",
+        "not available",
+    ])
+
+USERS_FILE = "users.json"
+users = {}
+PATIENTS_FILE = "patients.json"
+
+
+def _get_users_collection():
+    """Return users MongoDB collection when DB is available."""
+    collection = _connect_mongo()
+    if collection is None or _db is None:
+        return None
+    return _db["users"]
+
+
+def _load_patients_json():
+    """Read all records from patients.json; returns a list."""
+    if not os.path.exists(PATIENTS_FILE):
+        return []
+    try:
+        with open(PATIENTS_FILE, 'r') as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _append_to_patients_json(record):
+    """Append a single record to patients.json (creates file if absent)."""
+    existing = _load_patients_json()
+    existing.append(record)
+    with open(PATIENTS_FILE, 'w') as f:
+        json.dump(existing, f, indent=2)
+
+
+def migrate_patients_json_to_mongo():
+    """One-time migration: import any records from patients.json into MongoDB."""
+    collection = _connect_mongo()
+    if collection is None:
+        return
+    if not os.path.exists(PATIENTS_FILE):
+        return
+    try:
+        with open(PATIENTS_FILE, 'r') as f:
+            records = json.load(f)
+        if not isinstance(records, list) or len(records) == 0:
+            return
+        if collection.count_documents({}) == 0:
+            for rec in records:
+                rec.pop('_id', None)   
+            collection.insert_many(records)
+            print(f"✓ Migrated {len(records)} patient record(s) from patients.json to MongoDB")
+        else:
+            print("✓ MongoDB patients collection already has data — skipping JSON migration")
+    except Exception as e:
+        print(f"Migration warning: {e}")
+
+
+def to_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+_KNOWN_SYMPTOMS = [
+    "Fever", "Cough", "Runny Nose", "Shortness of Breath", "Fatigue", "Headache",
+    "Body Aches", "Sore Throat", "Nausea", "Vomiting", "Diarrhea", "Loss of Appetite",
+    "Chest Pain", "Chills", "Dizziness", "Joint Pain", "Muscle Pain", "Skin Rash",
+    "Frequent Urination", "Increased Thirst", "Blurred Vision", "High Blood Pressure",
+]
+
+_SYMPTOM_KEYWORDS = {
+    "Fever": ["fever", "pyrexia"],
+    "Cough": ["cough"],
+    "Runny Nose": ["runny nose", "rhinorrhea"],
+    "Shortness of Breath": ["shortness of breath", "breathlessness", "dyspnea"],
+    "Fatigue": ["fatigue", "tiredness"],
+    "Headache": ["headache"],
+    "Body Aches": ["body ache", "body pain"],
+    "Sore Throat": ["sore throat"],
+    "Nausea": ["nausea"],
+    "Vomiting": ["vomiting", "vomit"],
+    "Diarrhea": ["diarrhea", "loose motion", "loose stool"],
+    "Loss of Appetite": ["loss of appetite", "poor appetite"],
+    "Chest Pain": ["chest pain"],
+    "Chills": ["chills", "shivering"],
+    "Dizziness": ["dizziness", "giddiness"],
+    "Joint Pain": ["joint pain", "arthralgia"],
+    "Muscle Pain": ["muscle pain", "myalgia"],
+    "Skin Rash": ["skin rash", "rash"],
+    "Frequent Urination": ["frequent urination", "polyuria"],
+    "Increased Thirst": ["increased thirst", "polydipsia"],
+    "Blurred Vision": ["blurred vision"],
+    "High Blood Pressure": ["high blood pressure", "hypertension"],
+}
+
+
+def _extract_text_from_uploaded_report(uploaded_file) -> str:
+    """Extract plain text from uploaded image/pdf report where possible."""
+    if uploaded_file is None or not getattr(uploaded_file, "filename", ""):
+        return ""
+
+    filename = str(uploaded_file.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    temp_path = os.path.join(tempfile.gettempdir(), f"rural_report_{os.getpid()}_{filename}")
+
+    try:
+        uploaded_file.save(temp_path)
+        text = ""
+
+        if ext in {".jpg", ".jpeg", ".png"}:
+            try:
+                import pytesseract
+                from PIL import Image
+                tesseract_cmd = os.environ.get("TESSERACT_CMD", "").strip()
+                if tesseract_cmd:
+                    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+                text = pytesseract.image_to_string(Image.open(temp_path)) or ""
+            except Exception as e:
+                print(f"OCR extraction warning: {e}")
+                text = ""
+        elif ext == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(temp_path)
+                text = " ".join((page.extract_text() or "") for page in reader.pages)
+            except Exception:
+                try:
+                    import pdfplumber
+                    with pdfplumber.open(temp_path) as pdf:
+                        for page in pdf.pages:
+                            text += page.extract_text() or ""
+                except Exception as e:
+                    print(f"PDF extraction warning: {e}")
+                    text = ""
+
+        return text.strip()
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def _extract_report_fields(text: str) -> dict:
+    """Parse common patient/vitals fields from report text."""
+    if not text:
+        return {}
+
+    t = re.sub(r"\s+", " ", text).strip()
+    tl = t.lower()
+
+    fields = {
+        "patientName": "",
+        "age": "",
+        "bloodPressureSystolic": "",
+        "bloodPressureDiastolic": "",
+        "heartRate": "",
+        "temperature": "",
+        "sugarLevel": "",
+        "labTestResult": "",
+        "symptoms": [],
+    }
+
+    name_match = re.search(r"(?:patient\s*name|name)\s*[:\-]\s*([A-Za-z][A-Za-z\s]{1,60})", t, re.IGNORECASE)
+    if name_match:
+        fields["patientName"] = " ".join(name_match.group(1).split())
+
+    age_match = re.search(r"(?:age|yrs|years)\s*[:\-]?\s*(\d{1,3})", t, re.IGNORECASE)
+    if age_match:
+        fields["age"] = age_match.group(1)
+
+    bp_match = re.search(r"(?:bp|blood\s*pressure)\s*[:\-]?\s*(\d{2,3})\s*/\s*(\d{2,3})", t, re.IGNORECASE)
+    if not bp_match:
+        bp_match = re.search(r"\b(\d{2,3})\s*/\s*(\d{2,3})\s*mmhg\b", t, re.IGNORECASE)
+    if bp_match:
+        fields["bloodPressureSystolic"] = bp_match.group(1)
+        fields["bloodPressureDiastolic"] = bp_match.group(2)
+
+    hr_match = re.search(r"(?:heart\s*rate|pulse|hr)\s*[:\-]?\s*(\d{2,3})", t, re.IGNORECASE)
+    if hr_match:
+        fields["heartRate"] = hr_match.group(1)
+
+    temp_match = re.search(r"(?:temperature|temp)\s*[:\-]?\s*(\d{2,3}(?:\.\d+)?)\s*([CF])?", t, re.IGNORECASE)
+    if temp_match:
+        temp_val = float(temp_match.group(1))
+        temp_unit = (temp_match.group(2) or "F").upper()
+        if temp_unit == "C":
+            temp_val = (temp_val * 9.0 / 5.0) + 32.0
+        fields["temperature"] = f"{temp_val:.1f}".rstrip("0").rstrip(".")
+
+    sugar_match = re.search(r"(?:blood\s*sugar|glucose|rbs|fbs)\s*[:\-]?\s*(\d{2,3}(?:\.\d+)?)", t, re.IGNORECASE)
+    if sugar_match:
+        fields["sugarLevel"] = sugar_match.group(1)
+
+    lab_match = re.search(r"(?:lab\s*test\s*result|lab\s*result|hba1c)\s*[:\-]?\s*(\d+(?:\.\d+)?)", t, re.IGNORECASE)
+    if lab_match:
+        fields["labTestResult"] = lab_match.group(1)
+
+    detected_symptoms = []
+    for symptom in _KNOWN_SYMPTOMS:
+        keywords = _SYMPTOM_KEYWORDS.get(symptom, [symptom.lower()])
+        if any(kw in tl for kw in keywords):
+            detected_symptoms.append(symptom)
+    fields["symptoms"] = detected_symptoms
+
+    return fields
+
+
+def _merge_report_fields_into_data(data: dict, report_fields: dict) -> dict:
+    """Fill missing form fields using parsed report values."""
+    merged = dict(data or {})
+    for key, value in (report_fields or {}).items():
+        if key == "symptoms":
+            current = merged.get("symptoms")
+            if not isinstance(current, list) or len(current) == 0:
+                merged["symptoms"] = value if isinstance(value, list) else []
+            continue
+
+        current = str(merged.get(key, "")).strip()
+        if not current and str(value).strip():
+            merged[key] = value
+    return merged
+
+
+def get_request_data():
+    if request.is_json:
+        return request.get_json(silent=True) or {}, None
+
+    form_data = request.form.to_dict()
+    uploaded_file = request.files.get("medicalReport")
+
+    symptoms_value = form_data.get("symptoms")
+    if isinstance(symptoms_value, str):
+        try:
+            parsed_symptoms = json.loads(symptoms_value)
+            if isinstance(parsed_symptoms, list):
+                form_data["symptoms"] = parsed_symptoms
+            else:
+                form_data["symptoms"] = []
+        except json.JSONDecodeError:
+            form_data["symptoms"] = []
+    elif symptoms_value is None:
+        form_data["symptoms"] = []
+
+    return form_data, uploaded_file
+
+def load_users():
+    """Load users from MongoDB first, fallback to JSON file."""
+    global users
+
+    users_col = _get_users_collection()
+    if users_col is not None:
+        try:
+            db_users = list(users_col.find({}, {"_id": 0, "email": 1, "fullName": 1, "password": 1}))
+            users = {
+                str(u.get("email", "")).strip().lower(): {
+                    "email": str(u.get("email", "")).strip().lower(),
+                    "fullName": str(u.get("fullName", "")).strip(),
+                    "password": str(u.get("password", "")),
+                }
+                for u in db_users
+                if str(u.get("email", "")).strip()
+            }
+            if users:
+                return
+        except Exception as e:
+            print(f"Failed to load users from MongoDB: {e}")
+
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, 'r') as f:
+                users = json.load(f)
+        except Exception:
+            users = {}
+    else:
+        users = {}
+
+    # Best-effort migration from JSON to MongoDB when available.
+    if users and users_col is not None:
+        try:
+            for email, user in users.items():
+                normalized_email = str(email).strip().lower()
+                users_col.replace_one(
+                    {"email": normalized_email},
+                    {
+                        "email": normalized_email,
+                        "fullName": str(user.get("fullName", "")).strip(),
+                        "password": str(user.get("password", "")),
+                    },
+                    upsert=True,
+                )
+        except Exception as e:
+            print(f"JSON-to-Mongo user migration warning: {e}")
+
+
+def save_users():
+    """Save users to MongoDB and JSON (backup)."""
+    users_col = _get_users_collection()
+    if users_col is not None:
+        try:
+            for email, user in users.items():
+                normalized_email = str(email).strip().lower()
+                users_col.replace_one(
+                    {"email": normalized_email},
+                    {
+                        "email": normalized_email,
+                        "fullName": str(user.get("fullName", "")).strip(),
+                        "password": str(user.get("password", "")),
+                    },
+                    upsert=True,
+                )
+        except Exception as e:
+            print(f"Failed to save users to MongoDB: {e}")
+
+    try:
+        with open(USERS_FILE, 'w') as f:
+            json.dump(users, f)
+    except Exception as e:
+        print(f"Failed to save users.json backup: {e}")
+
+
+def store_patient_record(data, prediction_result, uploaded_report=None):
+    """Persist one patient visit and model result.
+    Saves to MongoDB only."""
+    symptoms = data.get("symptoms", [])
+    if not isinstance(symptoms, list):
+        symptoms = []
+
+    collection = _connect_mongo()
+    if collection is None:
+        print("Patient record was not saved: MongoDB is unavailable.")
+        return False
+
+    # Determine next sequential id
+    try:
+        latest = collection.find_one({}, sort=[("id", DESCENDING)], projection={"id": 1})
+        next_id = (latest or {}).get("id", 0) + 1
+    except Exception as e:
+        print(f"Failed to determine next MongoDB patient id: {e}")
+        return False
+
+    record = {
+        "id": next_id,
+        "createdAt": datetime.now().isoformat(timespec="seconds"),
+        "patientName": str(data.get("patientName", "")).strip() or "Unknown",
+        "age": str(data.get("age", "")).strip(),
+        "bloodPressureSystolic": str(data.get("bloodPressureSystolic", "")).strip(),
+        "bloodPressureDiastolic": str(data.get("bloodPressureDiastolic", "")).strip(),
+        "heartRate": str(data.get("heartRate", "")).strip(),
+        "temperature": str(data.get("temperature", "")).strip(),
+        "sugarLevel": str(data.get("sugarLevel", "")).strip(),
+        "labTestResult": str(data.get("labTestResult", "")).strip(),
+        "symptoms": symptoms,
+        "medicalReportName": uploaded_report.filename if uploaded_report else "",
+        "predictedDisease": prediction_result.get("predicted_disease", "N/A"),
+        "confidence": prediction_result.get("confidence", 0),
+        "riskCategory": prediction_result.get("risk_category", "Unknown"),
+        "riskScore": prediction_result.get("risk_score", 0),
+        "recommendation": prediction_result.get("recommendation", ""),
+    }
+
+    try:
+        collection.insert_one(record)
+        return True
+    except Exception as e:
+        print(f"Failed to save patient record to MongoDB: {e}")
+        return False
+
+def load_model():
+    global model
+    for model_path in MODEL_CANDIDATES:
+        if not os.path.exists(model_path):
+            continue
+
+        try:
+            with open(model_path, 'rb') as f:
+                model = pickle.load(f)
+            print(f"✓ Model loaded successfully from {model_path}")
+            return True
+        except Exception as e:
+            print(f"✗ Error loading model from {model_path}: {e}")
+
+    print("⚠ Warning: No trained model file found. Expected one of:")
+    for model_path in MODEL_CANDIDATES:
+        print(f"  - {model_path}")
+    return False
+
+def analyze_vitals(data):
+    """Analyze vital signs independently — returns risk_category and vitals_analysis"""
+    bp_sys = to_float(data.get('bloodPressureSystolic', 0))
+    bp_dia = to_float(data.get('bloodPressureDiastolic', 0))
+    hr = to_float(data.get('heartRate', 0))
+    temp = to_float(data.get('temperature', 0))
+    sugar = to_float(data.get('sugarLevel', 0))
+
+    # Individual vital status
+    if bp_sys >= 140 or bp_dia >= 90:
+        bp_status = "High"
+    elif bp_sys >= 120 or bp_dia >= 80:
+        bp_status = "Elevated"
+    else:
+        bp_status = "Normal"
+
+    if hr > 110 or hr < 50:
+        hr_status = "High Risk"
+    elif hr > 100:
+        hr_status = "Elevated"
+    else:
+        hr_status = "Normal"
+
+    if temp >= 102:
+        temp_status = "High Fever"
+    elif temp >= 100.4:
+        temp_status = "Fever"
+    else:
+        temp_status = "Normal"
+
+    if sugar >= 200:
+        sugar_status = "High"
+    elif sugar >= 126:
+        sugar_status = "Elevated"
+    else:
+        sugar_status = "Normal"
+
+    # Overall risk score from vitals
+    score = 0
+    age = to_float(data.get('age', 0))
+    if age >= 65: score += 18
+    elif age >= 50: score += 10
+    elif age < 12: score += 6
+
+    if bp_sys >= 160 or bp_dia >= 100: score += 22
+    elif bp_sys >= 140 or bp_dia >= 90: score += 14
+
+    if hr > 110 or hr < 50: score += 14
+    elif hr > 95: score += 8
+
+    if temp >= 102: score += 16
+    elif temp >= 100.4: score += 10
+
+    if sugar >= 250: score += 18
+    elif sugar >= 180: score += 12
+
+    lab = to_float(data.get('labTestResult', 0))
+    if lab >= 8: score += 14
+    elif lab >= 5: score += 8
+
+    symptoms = data.get('symptoms', [])
+    score += min(len(symptoms) * 4, 20)
+    if any(s in symptoms for s in ["Shortness of Breath", "Chest Pain"]):
+        score += 10
+
+    risk_score = max(5, min(95, round(score)))
+
+    if risk_score >= 70:
+        risk_category = "High"
+    elif risk_score >= 40:
+        risk_category = "Moderate"
+    else:
+        risk_category = "Low"
+
+    return {
+        "risk_category": risk_category,
+        "risk_score": risk_score,
+        "vitals_analysis": {
+            "bp": bp_status,
+            "heart_rate": hr_status,
+            "temperature": temp_status,
+            "sugar": sugar_status
+        }
+    }
+
+
+def evaluate_assessment(data):
+    """Fallback assessment when ML model is not loaded — uses LLM for advice."""
+    vitals = analyze_vitals(data)
+    risk_category = vitals["risk_category"]
+    symptoms = data.get("symptoms", [])
+    disease_label = "Unknown condition"
+    risk_prefix = _recommendation_for_risk(risk_category)
+    llm_advice = generate_advice(disease_label, symptoms)
+    recommendation = _shorten_answer(f"{risk_prefix} {llm_advice}", max_chars=220)
+    return {
+        "success": True,
+        "predicted_disease": "Not available (model not loaded)",
+        "confidence": 0,
+        "risk_category": risk_category,
+        "risk_score": vitals["risk_score"],
+        "vitals_analysis": vitals["vitals_analysis"],
+        "recommendation": recommendation,
+    }
+
+def _recommendation_for_risk(risk_category: str) -> str:
+    """Vitals-based risk recommendation used as a prefix to the LLM advice."""
+    if risk_category == "High":
+        return "Urgent physician review is advised."
+    elif risk_category == "Moderate":
+        return "Close follow-up within 24-48 hours is recommended."
+    else:
+        return "Continue supportive care and monitor for changes."
+
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    """
+    Predict health assessment based on patient data
+    Expected JSON from React form:
+    {
+        "patientName": string,
+        "age": string,
+        "bloodPressureSystolic": string,
+        "bloodPressureDiastolic": string,
+        "heartRate": string,
+        "temperature": string,
+        "sugarLevel": string,
+        "labTestResult": string,
+        "symptoms": [list of symptom strings]
+    }
+    """
+    try:
+        data, uploaded_report = get_request_data()
+
+        if uploaded_report is not None:
+            report_text = _extract_text_from_uploaded_report(uploaded_report)
+            parsed_fields = _extract_report_fields(report_text)
+            data = _merge_report_fields_into_data(data, parsed_fields)
+        
+        if not data:
+            return jsonify({
+                "disease": "Error",
+                "risk": 0,
+                "error": "No data provided"
+            }), 400
+        
+        if model is not None:
+            try:
+                from collections import Counter
+                symptoms_selected = data.get("symptoms", [])
+
+                if not isinstance(model, dict):
+                    raise ValueError("Unexpected model format — expected dict")
+
+                # Extract the three sub-models
+                svm_clf = model["final_svm_model"]
+                nb_clf  = model["final_nb_model"]
+                rf_clf  = model["final_rf_model"]
+
+                # Build input vector from RF feature names (all three share the same schema)
+                if not hasattr(rf_clf, "feature_names_in_"):
+                    raise ValueError("RF model has no feature_names_in_")
+                features = list(rf_clf.feature_names_in_)
+
+                print(f"\n=== PREDICTION DEBUG ===")
+                print(f"Total features: {len(features)}")
+                print(f"Symptoms selected: {symptoms_selected}")
+
+                # Zero-fill all columns
+                input_data = {col: 0 for col in features}
+
+                # Map each selected symptom to its slot (Symptom_1 … Symptom_17)
+                # Feature format in model: "Symptom_N_ symptom_name"
+                matched = []
+                for i, symptom in enumerate(symptoms_selected[:17], start=1):
+                    norm = symptom.lower().replace(" ", "_").strip()
+                    col  = f"Symptom_{i}_ {norm}"
+                    if col in input_data:
+                        input_data[col] = 1
+                        matched.append(col)
+                    else:
+                        col2 = f"Symptom_{i}_{norm}"
+                        if col2 in input_data:
+                            input_data[col2] = 1
+                            matched.append(col2)
+
+                print(f"Matched columns ({len(matched)}): {matched}")
+
+                input_df = pd.DataFrame([input_data])[features]
+
+                # Majority vote across all 3 models
+                svm_pred = str(svm_clf.predict(input_df)[0])
+                nb_pred  = str(nb_clf.predict(input_df)[0])
+                rf_pred  = str(rf_clf.predict(input_df)[0])
+
+                print(f"SVM: {svm_pred} | NB: {nb_pred} | RF: {rf_pred}")
+
+                votes = Counter([svm_pred, nb_pred, rf_pred])
+                predicted_disease = votes.most_common(1)[0][0]
+                confidence = round((votes[predicted_disease] / 3) * 100, 2)
+
+                print(f"Final (majority vote): {predicted_disease} — confidence {confidence}%")
+                print("========================\n")
+
+                vitals = analyze_vitals(data)
+
+                symptoms_selected = data.get("symptoms", [])
+                llm_advice = generate_advice(predicted_disease, symptoms_selected)
+                risk_prefix = _recommendation_for_risk(vitals["risk_category"])
+                recommendation = _shorten_answer(
+                    f"{risk_prefix} AI advice for {predicted_disease}: {llm_advice}",
+                    max_chars=220,
+                )
+
+                response_payload = {
+                    "predicted_disease": predicted_disease,
+                    "confidence": confidence,
+                    "risk_category": vitals["risk_category"],
+                    "risk_score": vitals["risk_score"],
+                    "vitals_analysis": vitals["vitals_analysis"],
+                    "recommendation": recommendation,
+                    "model_votes": {"svm": svm_pred, "nb": nb_pred, "rf": rf_pred},
+                    "patientName": str(data.get("patientName", "")).strip(),
+                    "age": str(data.get("age", "")).strip(),
+                    "bloodPressureSystolic": str(data.get("bloodPressureSystolic", "")).strip(),
+                    "bloodPressureDiastolic": str(data.get("bloodPressureDiastolic", "")).strip(),
+                    "heartRate": str(data.get("heartRate", "")).strip(),
+                    "temperature": str(data.get("temperature", "")).strip(),
+                    "sugarLevel": str(data.get("sugarLevel", "")).strip(),
+                    "labTestResult": str(data.get("labTestResult", "")).strip(),
+                    "symptoms": data.get("symptoms", []) if isinstance(data.get("symptoms", []), list) else [],
+                }
+
+                saved_ok = store_patient_record(data, response_payload, uploaded_report)
+                response_payload["saved_to_db"] = bool(saved_ok)
+                return jsonify(response_payload), 200
+
+            except Exception as e:
+                print(f"Model prediction error: {e}")
+                import traceback; traceback.print_exc()
+                result = evaluate_assessment(data)
+                result.update({
+                    "patientName": str(data.get("patientName", "")).strip(),
+                    "age": str(data.get("age", "")).strip(),
+                    "bloodPressureSystolic": str(data.get("bloodPressureSystolic", "")).strip(),
+                    "bloodPressureDiastolic": str(data.get("bloodPressureDiastolic", "")).strip(),
+                    "heartRate": str(data.get("heartRate", "")).strip(),
+                    "temperature": str(data.get("temperature", "")).strip(),
+                    "sugarLevel": str(data.get("sugarLevel", "")).strip(),
+                    "labTestResult": str(data.get("labTestResult", "")).strip(),
+                    "symptoms": data.get("symptoms", []) if isinstance(data.get("symptoms", []), list) else [],
+                })
+                saved_ok = store_patient_record(data, result, uploaded_report)
+                result["saved_to_db"] = bool(saved_ok)
+                return jsonify(result), 200
+        else:
+            result = evaluate_assessment(data)
+            result.update({
+                "patientName": str(data.get("patientName", "")).strip(),
+                "age": str(data.get("age", "")).strip(),
+                "bloodPressureSystolic": str(data.get("bloodPressureSystolic", "")).strip(),
+                "bloodPressureDiastolic": str(data.get("bloodPressureDiastolic", "")).strip(),
+                "heartRate": str(data.get("heartRate", "")).strip(),
+                "temperature": str(data.get("temperature", "")).strip(),
+                "sugarLevel": str(data.get("sugarLevel", "")).strip(),
+                "labTestResult": str(data.get("labTestResult", "")).strip(),
+                "symptoms": data.get("symptoms", []) if isinstance(data.get("symptoms", []), list) else [],
+            })
+            saved_ok = store_patient_record(data, result, uploaded_report)
+            result["saved_to_db"] = bool(saved_ok)
+            return jsonify(result), 200
+            
+    except Exception as e:
+        print(f"Error in prediction: {e}")
+        return jsonify({
+            "predicted_disease": "Error",
+            "confidence": 0,
+            "risk_category": "Unknown",
+            "risk_score": 0,
+            "vitals_analysis": {},
+            "error": f"Prediction failed: {str(e)}"
+        }), 500
+
+
+
+_GENERAL_AI_KNOWLEDGE: list[tuple[list[str], str]] = [
+    (["fever", "temperature", "high temp"],
+     "A fever (temperature above 100.4 °F / 38 °C) usually signals infection. Rest, stay hydrated with ORS or clean water, and take paracetamol for temperature above 102 °F. If the fever lasts more than 3 days or exceeds 104 °F, visit the nearest health facility immediately."),
+    (["malaria", "mosquito", "chills", "shivering"],
+     "Malaria is spread by mosquito bites and causes fever, chills, and body aches. Take antimalarial medication as prescribed by a health worker. Prevent it by sleeping under insecticide-treated nets and removing stagnant water near your home."),
+    (["diabetes", "blood sugar", "sugar level", "glucose"],
+     "Diabetes means your blood sugar is too high. Eat less sugar and white rice; prefer whole grains and vegetables. Exercise 30 minutes daily, take your medicine regularly, and check your blood sugar every week. Fasting sugar above 126 mg/dL needs medical attention."),
+    (["blood pressure", "hypertension", "bp", "high bp"],
+     "High blood pressure (above 140/90 mmHg) damages the heart and kidneys silently. Reduce salt, avoid alcohol and tobacco, exercise gently, and take prescribed medications daily. Check your BP at least once a month."),
+    (["cough", "cold", "flu", "respiratory", "breathing"],
+     "For a cough or cold, rest and drink warm fluids. Steam inhalation can relieve congestion. If you have difficulty breathing, cough with blood, or fever above 102 °F, see a health worker — it could be pneumonia or TB."),
+    (["diarrhea", "loose stools", "vomiting", "dehydration"],
+     "Diarrhea causes dangerous dehydration rapidly. Drink ORS (Oral Rehydration Solution) or clean water with a pinch of salt and sugar. Avoid raw food. If there is blood in stools or vomiting persists more than 12 hours, go to a clinic immediately."),
+    (["chest pain", "heart", "heart attack", "cardiac"],
+     "Chest pain or tightness is a serious warning sign. Stop all activity, sit or lie down, and call for emergency help immediately. Do not ignore chest pain — it could be a heart attack. Chew an aspirin (325 mg) if available and there is no allergy."),
+    (["anemia", "pale", "weakness", "iron", "hemoglobin"],
+     "Anemia means low iron in the blood, causing fatigue, pale skin, and breathlessness. Eat iron-rich foods: leafy greens (spinach), beans, eggs, and meat. Take iron supplements as prescribed. Pregnant women and children are especially vulnerable."),
+    (["tuberculosis", "tb", "night sweats", "blood cough"],
+     "TB is a curable bacterial infection of the lungs. Symptoms: cough for more than 2 weeks, night sweats, weight loss, and blood in sputum. Get a free TB test at your government health center. Complete the full 6-month medication course — stopping early causes drug-resistant TB."),
+    (["typhoid", "enteric fever", "stomach pain", "abdominal"],
+     "Typhoid causes prolonged fever, stomach pain, and weakness. It spreads through contaminated water and food. Antibiotics prescribed by a doctor cure it. Always drink boiled or filtered water and wash hands before eating."),
+    (["pregnancy", "prenatal", "antenatal", "maternal"],
+     "During pregnancy, attend all antenatal checkups (at least 4 visits). Take iron and folic acid supplements daily. Eat nutritious food, avoid alcohol and tobacco. Institutional delivery is strongly recommended — go to a health facility when labor begins."),
+    (["child", "infant", "baby", "vaccination", "immunization"],
+     "All children must be vaccinated on schedule (BCG, Polio, DPT, Measles etc.). Breastfeed exclusively for 6 months. Monitor the child's weight monthly. If the child has high fever, convulsions, or refuses to feed, seek medical care immediately."),
+    (["skin", "rash", "allergy", "itch"],
+     "Skin rashes can be caused by allergies, infections, or insect bites. Keep the area clean and dry. Calamine lotion or antihistamines help with itching. If the rash spreads rapidly, is painful, or is accompanied by fever, see a health worker."),
+    (["injury", "wound", "bleeding", "cut"],
+     "Clean the wound immediately with clean water and apply gentle pressure to stop bleeding. Cover with a clean cloth or bandage. Watch for signs of infection: redness, swelling, pus, or fever. Deep or large wounds need stitching at a clinic."),
+    (["mental health", "depression", "stress", "anxiety", "mental"],
+     "Mental health is as important as physical health. Talk to a trusted person about your feelings. Maintain a daily routine, get enough sleep, and limit alcohol. If you feel persistently sad, hopeless, or have thoughts of self-harm, contact a mental health worker."),
+    (["nutrition", "diet", "malnutrition", "weight loss", "food"],
+     "A balanced diet includes grains, pulses/beans, vegetables, fruits, and some protein (eggs/meat/fish). MUAC measurement below 11.5 cm in children under 5 indicates severe malnutrition — visit a nutrition rehabilitation center. Avoid processed food high in salt and sugar."),
+    (["water", "sanitation", "hygiene", "handwash"],
+     "Always drink boiled or filtered water. Wash hands with soap before eating and after using the toilet. Build and use a proper toilet — open defecation spreads disease. Dispose of garbage properly to prevent mosquito and fly breeding."),
+    (["snake bite", "snakebite", "scorpion", "bite"],
+     "Stay calm — panic speeds venom spread. Immobilize the bitten limb, keep it below heart level, remove jewellery, and go to the nearest hospital immediately with anti-venom. Do NOT cut, suck the wound, or apply a tourniquet."),
+    (["first aid", "emergency", "help"],
+     "For any emergency: call local ambulance services. Basic first aid: control bleeding with pressure, keep the patient calm and warm, do not give food or water if surgery may be needed. CPR (chest compressions) for unconscious patients who are not breathing."),
+]
+
+def _keyword_answer(question: str) -> str | None:
+    q_lower = question.lower()
+    for keywords, answer in _GENERAL_AI_KNOWLEDGE:
+        if any(kw in q_lower for kw in keywords):
+            return _apply_fixed_style(answer)
+    return None
+
+
+def _llm_chat_answer(question: str) -> str | None:
+    """Try to get a useful answer from distilgpt2."""
+    llm = _get_llm()
+    if llm is None:
+        return None
+    prompt = (
+        "You are a rural healthcare assistant providing simple, accurate medical advice. "
+        f"Patient question: {question} "
+        "Answer:"
+    )
+    try:
+        outputs = llm(prompt, max_new_tokens=100, do_sample=False, truncation=True)
+        full_text: str = outputs[0]["generated_text"]
+        answer = full_text[len(prompt):].strip()
+        if len(answer) < 20:
+            return None
+        sentences = re.split(r'(?<=[.!?])\s+', answer)
+        result = " ".join(sentences[:3]).strip()
+        if result and result[-1] not in ".!?":
+            result += "."
+        return _apply_fixed_style(result) if len(result) > 20 else None
+    except Exception as e:
+        print(f"LLM chat error: {e}")
+        return None
+
+
+@app.route('/clear-session', methods=['POST'])
+def clear_session():
+    data = request.get_json(silent=True) or {}
+    session_id = str(data.get("session_id", "default")).strip() or "default"
+    sessions.pop(session_id, None)
+    session_token_usage.pop(session_id, None)
+    clear_chat_session(session_id)
+    return jsonify({"cleared": True}), 200
+
+
+def get_disease_info_from_kb(disease_name: str, question_type: str = "full summary") -> str:
+    """Return KB answer text for a disease and question type."""
+    kb = _load_local_disease_kb()
+    qa = kb.get(str(disease_name or "").strip(), {}) if isinstance(kb, dict) else {}
+    if not isinstance(qa, dict) or not qa:
+        return "Information not available in the knowledge base."
+
+    normalized_q = str(question_type or "").strip().lower()
+    query_lower = normalized_q
+
+    if normalized_q in {"full summary", "full_summary", "summary", "full"}:
+        return limit_response_words(_build_kb_style_answer(str(disease_name), qa, None), 350)
+
+    if any(w in query_lower for w in ["stage", "stages", "level", "grade", "how bad", "how serious"]):
+        field = str(qa.get("Stages", "")).strip()
+        if field:
+            return limit_response_words(f"Stages of {disease_name}: {field}", 200)
+        return "Stage information is currently limited for this disease."
+
+    if any(w in query_lower for w in ["emergency sign", "very emergency", "critical sign", "life threatening", "danger sign", "when is it dangerous"]):
+        field = str(qa.get("Emergency signs", "")).strip()
+        if field:
+            return limit_response_words(f"Emergency warning signs of {disease_name}: {field}", 200)
+        return "Emergency warning signs are currently limited for this disease."
+
+    return limit_response_words(_build_kb_style_answer(str(disease_name), qa, str(question_type)), 200)
+
+
+@app.route('/predict-disease', methods=['POST'])
+def predict_disease():
+    """Predict disease from symptoms using the trained 3-model voting bundle."""
+    data = request.get_json(silent=True) or {}
+    symptoms = data.get("symptoms", [])
+    session_id = str(data.get("session_id", "default")).strip() or "default"
+
+    if not isinstance(model, dict):
+        return jsonify({"error": "ML model not loaded"}), 503
+
+    model_data = model
+    symptom_index = model_data.get("symptom_index", {})
+    if not isinstance(symptom_index, dict) or not symptom_index:
+        return jsonify({"error": "Invalid model: symptom_index missing"}), 500
+
+    if not isinstance(symptoms, list):
+        return jsonify({"error": "Invalid symptoms", "valid_symptoms": list(symptom_index.keys())}), 400
+
+    normalized_symptoms = [str(s).strip() for s in symptoms if str(s).strip()]
+    valid_symptoms = list(symptom_index.keys())
+    invalid = [s for s in normalized_symptoms if s not in symptom_index]
+    if invalid:
+        return jsonify({
+            "error": "Invalid symptoms",
+            "valid_symptoms": valid_symptoms,
+        }), 400
+
+    try:
+        from collections import Counter
+
+        input_vector = [0] * 17
+        for symptom in normalized_symptoms:
+            idx = symptom_index[symptom]
+            if isinstance(idx, int) and 0 <= idx < 17:
+                input_vector[idx] = 1
+
+        svm_pred = model_data["final_svm_model"].predict([input_vector])[0]
+        nb_pred = model_data["final_nb_model"].predict([input_vector])[0]
+        rf_pred = model_data["final_rf_model"].predict([input_vector])[0]
+
+        final_prediction = Counter([svm_pred, nb_pred, rf_pred]).most_common(1)[0][0]
+        qa_summary = get_disease_info_from_kb(str(final_prediction), "full summary")
+
+        _set_session_disease(session_id, str(final_prediction), "english")
+
+        return jsonify({
+            "predicted_disease": str(final_prediction),
+            "svm": str(svm_pred),
+            "nb": str(nb_pred),
+            "rf": str(rf_pred),
+            "qa_summary": qa_summary,
+        }), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint - fast response without Ollama check"""
+    try:
+        from chatbot_response import _SESSION_LAST_DISEASE
+        process = psutil.Process(os.getpid())
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        active_sessions = len(_SESSION_LAST_DISEASE)
+        
+        return jsonify({
+            "status": "ok",
+            "memory_mb": round(memory_mb, 2),
+            "active_sessions": active_sessions,
+            "max_sessions": MAX_SESSIONS,
+            "message": "Backend API Running"
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/model-info', methods=['GET'])
+def model_info():
+    """Debug: show model structure"""
+    if model is None:
+        return jsonify({"error": "Model not loaded"}), 500
+    if isinstance(model, dict):
+        info = {"type": "dict", "keys": list(model.keys())}
+        for k, v in model.items():
+            info[k + "_type"] = str(type(v).__name__)
+            if hasattr(v, 'classes_'):
+                info[k + "_diseases"] = list(v.classes_)
+            if hasattr(v, 'feature_names_in_'):
+                info[k + "_features_sample"] = list(v.feature_names_in_)[:10]
+                info[k + "_feature_count"] = int(v.n_features_in_)
+        # Expose symptom_index
+        si = model.get("symptom_index", {})
+        if isinstance(si, dict):
+            info["symptom_index_type"] = "dict"
+            info["symptom_index_count"] = len(si)
+            info["symptom_index_sample"] = {k: v for k, v in list(si.items())[:10]}
+        import numpy as np
+        pc = model.get("predictions_classes")
+        if pc is not None:
+            info["predictions_classes"] = list(pc)
+        return jsonify(info), 200
+    return jsonify({
+        "type": str(type(model).__name__),
+        "diseases": list(model.classes_),
+        "disease_count": len(model.classes_),
+        "features": list(getattr(model, "feature_names_in_", [])),
+        "feature_count": len(getattr(model, "feature_names_in_", [])),
+    }), 200
+
+
+
+ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL",    "admin@ruralhealthcare.com")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@2026")
+
+
+@app.route('/admin-login', methods=['POST'])
+def admin_login():
+    """Admin login endpoint for dashboard authentication"""
+    try:
+        data = request.get_json(silent=True) or {}
+        email = str(data.get("email", "")).strip()
+        password = str(data.get("password", "")).strip()
+        
+        if not email or not password:
+            return jsonify({"success": False, "error": "Email and password are required"}), 400
+        
+        if email == ADMIN_EMAIL and password == ADMIN_PASSWORD:
+            return jsonify({"success": True, "message": "Admin authenticated"}), 200
+        else:
+            return jsonify({"success": False, "error": "Invalid email or password"}), 401
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/patients', methods=['GET'])
+def get_patients():
+    """Return patient records for the admin dashboard."""
+    try:
+        collection = _connect_mongo()
+        if collection is not None:
+            records = list(collection.find({}, {"_id": 0}).sort([("id", 1)]))
+            return jsonify({"success": True, "patients": records}), 200
+
+        records = _load_patients_json()
+        return jsonify({"success": True, "patients": records}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/patients/<int:patient_id>', methods=['DELETE'])
+def delete_patient(patient_id: int):
+    """Delete a patient record by id for the admin dashboard."""
+    try:
+        collection = _connect_mongo()
+        if collection is not None:
+            result = collection.delete_one({"id": patient_id})
+            if result.deleted_count > 0:
+                return jsonify({"success": True, "message": "Patient record deleted"}), 200
+            return jsonify({"success": False, "error": "Patient record not found"}), 404
+
+        records = _load_patients_json()
+        filtered = [record for record in records if int(record.get("id", -1)) != patient_id]
+        if len(filtered) == len(records):
+            return jsonify({"success": False, "error": "Patient record not found"}), 404
+
+        with open(PATIENTS_FILE, 'w') as handle:
+            json.dump(filtered, handle, indent=2)
+        return jsonify({"success": True, "message": "Patient record deleted"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/patients/delete/all', methods=['DELETE'])
+def delete_all_patients():
+    """Delete ALL patient records - requires admin authentication."""
+    try:
+        collection = _connect_mongo()
+        if collection is not None:
+            result = collection.delete_many({})
+            return jsonify({"success": True, "message": f"Deleted {result.deleted_count} patient records"}), 200
+
+        # Delete from JSON file
+        with open(PATIENTS_FILE, 'w') as handle:
+            json.dump([], handle, indent=2)
+        return jsonify({"success": True, "message": "All patient records deleted"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/ai-chat', methods=['POST'])
+def ai_chat():
+    """
+    TRANSLATION-FIRST AI ASSISTANT ENDPOINT
+    
+    STEP 1: Check if user is requesting translation → NLLB-200 ONLY (never Mistral)
+    STEP 2: If not translation, use pipeline to get response
+    STEP 3: Store response in session for future translation requests
+    STEP 4: Return response (pure script enforced)
+    
+    Request:  { "message": "user question", "session_id": "optional" }
+    Response: { "reply": "answer", "status": "ok" }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        message = str(data.get("message", "")).strip()
+        session_id = str(data.get("session_id", "default")).strip() or "default"
+
+        if not message:
+            return jsonify({"error": "message is required"}), 400
+
+        # Hard safety cap for API callers; UI already enforces same limit.
+        if len(message) > MAX_INPUT_CHARS:
+            message = _trim_to_word_boundary(message, MAX_INPUT_CHARS).strip()
+
+        # ===== CHECK RESPONSE LIMIT PER SESSION FIRST =====
+        from chatbot_response import _SESSION_LAST_DISEASE
+        session_data = _SESSION_LAST_DISEASE.get(session_id, {})
+        response_count = session_data.get("response_count", 0)
+
+        # If session explicitly blocked (previous limit reached), immediately reject
+        if session_data.get("blocked"):
+            return jsonify({
+                "reply": "Sorry, maximum responses reached. Please start a new chat.",
+                "status": "ok",
+                "response_count": session_data.get("response_count", MAX_RESPONSES),
+                "limit_reached": True
+            }), 200
+
+        # Warn at response 9 (one before limit)
+        warning = ""
+        if response_count == (MAX_RESPONSES - 1):
+            warning = " ⚠️ WARNING: This is your last response. Please start a new chat after this."
+
+        # Block at response MAX_RESPONSES or more: mark session blocked instead of deleting it
+        if response_count >= MAX_RESPONSES:
+            # Mark session as blocked so subsequent requests are rejected until cleared
+            _SESSION_LAST_DISEASE[session_id] = {
+                "disease": session_data.get("disease", ""),
+                "last_question_type": session_data.get("last_question_type", ""),
+                "timestamp": datetime.now(),
+                "response_count": MAX_RESPONSES,
+                "language": session_data.get("language", "english"),
+                "blocked": True,
+            }
+
+            return jsonify({
+                "reply": "Sorry, maximum responses reached. Please start a new chat.",
+                "status": "ok",
+                "response_count": MAX_RESPONSES,
+                "limit_reached": True
+            }), 200
+
+        # ===== STEP 1: DETECT TRANSLATION QUERY (NLLB-ONLY PATH) =====
+        if is_translation_query(message):
+            # Get last response from session
+            last_response = _SESSION_LAST_RESPONSE.get(session_id, "")
+            
+            if not last_response.strip():
+                reply = "Please ask a health question first."
+            else:
+                # Translate using NLLB-200 only (NEVER Mistral)
+                target_lang = detect_language(message)
+                translated = translate_text(last_response, "eng_Latn", target_lang)
+                
+                # Remove any mixed language characters
+                clean_output = enforce_language(translated, target_lang)
+                
+                if not clean_output.strip():
+                    reply = "Translation failed. Please try again."
+                else:
+                    reply = clean_output.strip()
+
+                # Enforce translation response word limit (300 words)
+                reply = limit_response_words(reply, 300)
+
+                # Store translated response as new last response
+                _SESSION_LAST_RESPONSE[session_id] = reply
+            
+            # Increment response counter
+            if session_id in _SESSION_LAST_DISEASE:
+                _SESSION_LAST_DISEASE[session_id]["response_count"] = response_count + 1
+            
+            # Append warning if on last response
+            final_reply = reply + warning
+            
+            return jsonify({
+                "reply": final_reply,
+                "status": "ok",
+                "response_count": response_count + 1,
+                "limit_reached": False
+            }), 200
+
+        # ===== STEP 2: NOT A TRANSLATION - USE PIPELINE =====
+        # Get current disease before processing (to detect if it changes)
+        old_disease = _get_session_disease(session_id)
+
+        # IMPORTANT: Ensure session is initialized with response_count even if no disease yet
+        if session_id not in _SESSION_LAST_DISEASE:
+            _SESSION_LAST_DISEASE[session_id] = {
+                "disease": "",
+                "last_question_type": "",
+                "timestamp": datetime.now(),
+                "response_count": response_count,
+                "language": "english"
+            }
+        
+        reply = pipeline_process_query(
+            query=message,
+            session_id=session_id,
+            predicted_disease=None
+        )
+        
+        # Check if disease changed and clear history if it did
+        new_disease = _get_session_disease(session_id)
+        if old_disease and new_disease and old_disease.lower() != new_disease.lower():
+            # Disease topic changed - clear full conversation history to prevent Mistral confusion
+            _SESSION_HISTORY[session_id] = []
+        
+        # Enforce word limit
+        if reply:
+            words = reply.split()
+            if len(words) > 150:
+                reply = " ".join(words[:150]) + "..."
+        
+        # ===== STEP 3: UPDATE CONVERSATION HISTORY (limit to MAX_HISTORY to prevent Mistral confusion) =====
+        if reply:
+            update_history(session_id, message, reply)
+        
+        # ===== STEP 4: STORE RESPONSE IN SESSION FOR FUTURE TRANSLATION =====
+        if reply and not is_translation_query(message):
+            _SESSION_LAST_RESPONSE[session_id] = reply
+        
+        # ===== STEP 5: INCREMENT RESPONSE COUNTER =====
+        if session_id in _SESSION_LAST_DISEASE:
+            _SESSION_LAST_DISEASE[session_id]["response_count"] = response_count + 1
+        
+        # Append warning if on last response
+        final_reply = reply + warning
+        
+        return jsonify({
+            "reply": final_reply,
+            "status": "ok",
+            "response_count": response_count + 1,
+            "limit_reached": False
+        }), 200
+
+    except Exception as e:
+        print(f"AI chat error: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({
+            "reply": "Sorry, I encountered an error. Please try again.",
+            "status": "error",
+            "error_details": str(e)
+        }), 500
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def is_valid_gmail_email(email: str) -> bool:
+    return re.fullmatch(r"[A-Za-z0-9._%+-]+@gmail\.com", email or "") is not None
+
+
+def _store_feedback_to_mongo(
+    name: str,
+    email: str,
+    subject: str,
+    message: str,
+    delivery: str = "unknown",
+    delivery_status: str = "pending",
+) -> bool:
+    """Persist feedback in MongoDB."""
+    collection = _connect_mongo()
+    if collection is None or _db is None:
+        return False
+
+    try:
+        feedback_col = _db["feedback"]
+        feedback_col.insert_one({
+            "createdAt": datetime.now().isoformat(timespec="seconds"),
+            "name": name,
+            "email": email,
+            "subject": subject,
+            "message": message,
+            "source": "website_form",
+            "delivery": delivery,
+            "delivery_status": delivery_status,
+        })
+        return True
+    except Exception as e:
+        print(f"Failed to store feedback in MongoDB: {e}")
+        return False
+
+
+@app.route('/send-feedback', methods=['POST'])
+def send_feedback():
+    """Send feedback email from the website feedback form."""
+    try:
+        data = request.get_json(silent=True) or {}
+        print(f"[send-feedback] incoming data: {data}")
+        name = str(data.get("name", "")).strip()
+        email = str(data.get("email", "")).strip()
+        subject = str(data.get("subject", "General Feedback")).strip() or "General Feedback"
+        message = str(data.get("message", "")).strip()
+
+        if not name or not email or not message:
+            return jsonify({"success": False, "error": "Name, email, and message are required."}), 400
+
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return jsonify({"success": False, "error": "Please provide a valid email address."}), 400
+
+        delivery = "mongo"
+        delivery_status = "saved"
+
+        smtp_configured = (
+            SMTP_USER
+            and SMTP_PASSWORD
+            and SMTP_USER != "your_email@gmail.com"
+            and SMTP_PASSWORD != "your_app_password"
+        )
+
+        if smtp_configured:
+            try:
+                msg = MIMEMultipart()
+                msg["From"] = SMTP_USER
+                msg["To"] = FEEDBACK_TO_EMAIL
+                msg["Reply-To"] = email
+                msg["Subject"] = subject
+
+                body = (
+                    "New feedback received from Rural Healthcare website\n\n"
+                    f"Name: {name}\n"
+                    f"Email: {email}\n"
+                    f"Subject: {subject}\n\n"
+                    "Message:\n"
+                    f"{message}\n"
+                )
+                msg.attach(MIMEText(body, "plain"))
+                # Prefer SendGrid when configured
+                if SENDGRID_API_KEY and SendGridAPIClient is not None and Mail is not None:
+                    try:
+                        sg_body = body
+                        sendgrid_msg = Mail(
+                            from_email=email or SMTP_USER,
+                            to_emails=FEEDBACK_TO_EMAIL,
+                            subject=subject,
+                            plain_text_content=sg_body,
+                        )
+                        sg = SendGridAPIClient(SENDGRID_API_KEY)
+                        resp = sg.send(sendgrid_msg)
+                        if resp.status_code in (200, 202):
+                            delivery = "sendgrid"
+                            delivery_status = "sent"
+                        else:
+                            print(f"SendGrid returned status {resp.status_code}")
+                    except Exception as sg_err:
+                        print(f"SendGrid error: {sg_err}")
+
+                # Fallback to SMTP if SendGrid not available or failed
+                if delivery != "sendgrid":
+                    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15) as server:
+                        server.starttls()
+                        server.login(SMTP_USER, SMTP_PASSWORD)
+                        server.sendmail(SMTP_USER, FEEDBACK_TO_EMAIL, msg.as_string())
+                    delivery = "email"
+                    delivery_status = "sent"
+
+                stored = _store_feedback_to_mongo(name, email, subject, message, delivery=delivery, delivery_status=delivery_status)
+                if delivery == "sendgrid":
+                    response_message = "Feedback sent and saved successfully."
+                elif delivery == "email":
+                    response_message = "Feedback emailed and saved successfully."
+                else:
+                    response_message = "Feedback saved successfully. Our team will review it soon."
+
+                return jsonify({
+                    "success": True,
+                    "message": response_message,
+                    "delivery": delivery,
+                    "stored": stored,
+                }), 200
+            except Exception as e:
+                print(f"Send feedback email error: {e}")
+
+        if _store_feedback_to_mongo(name, email, subject, message, delivery=delivery, delivery_status=delivery_status):
+            return jsonify({
+                "success": True,
+                "message": "Feedback saved successfully. Our team will review it soon.",
+                "delivery": "mongo",
+            }), 200
+
+        return jsonify({
+            "success": False,
+            "error": "Feedback could not be delivered or stored. Please try again later.",
+        }), 503
+    except Exception as e:
+        print(f"Send feedback error: {e}")
+        return jsonify({"success": False, "error": "Failed to send feedback."}), 500
+
+@app.route('/register', methods=['POST'])
+def register():
+    """Register a new user"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"success": False, "error": "No data provided"}), 400
+        
+        fullname = data.get('fullName', '').strip()
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '').strip()
+        
+        if not fullname or not email or not password:
+            return jsonify({"success": False, "error": "All fields are required"}), 400
+
+        if not is_valid_gmail_email(email):
+            return jsonify({"success": False, "error": "Please enter a valid Gmail address ending with @gmail.com"}), 400
+
+        if len(password) < 6:
+            return jsonify({"success": False, "error": "Password must be at least 6 characters"}), 400
+        
+        users_col = _get_users_collection()
+        if users_col is not None:
+            existing = users_col.find_one({"email": email}, {"_id": 1})
+            if existing:
+                return jsonify({"success": False, "error": "Email already registered"}), 409
+        elif email in users:
+            return jsonify({"success": False, "error": "Email already registered"}), 409
+        
+        users[email] = {
+            "fullName": fullname,
+            "email": email,
+            "password": hash_password(password)
+        }
+        save_users()
+        
+        return jsonify({
+            "success": True,
+            "message": "Registration successful",
+            "user": {"email": email, "fullName": fullname}
+        }), 201
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Authenticate user"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"success": False, "error": "No data provided"}), 400
+        
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '').strip()
+        
+        if not email or not password:
+            return jsonify({"success": False, "error": "Email and password are required"}), 400
+
+        if not is_valid_gmail_email(email):
+            return jsonify({"success": False, "error": "Please enter a valid Gmail address ending with @gmail.com"}), 400
+        
+        user = None
+        users_col = _get_users_collection()
+        if users_col is not None:
+            user = users_col.find_one({"email": email}, {"_id": 0})
+            if user:
+                users[email] = {
+                    "fullName": str(user.get("fullName", "")).strip(),
+                    "email": email,
+                    "password": str(user.get("password", "")),
+                }
+                user = users[email]
+
+        if user is None:
+            user = users.get(email)
+
+        if not user:
+            return jsonify({"success": False, "error": "Invalid email or password"}), 401
+
+        stored = user['password']
+
+        # Support both hashed passwords and legacy plain-text passwords
+        password_ok = (stored == hash_password(password)) or (stored == password)
+        if not password_ok:
+            return jsonify({"success": False, "error": "Invalid email or password"}), 401
+
+        if stored == password:
+            users[email]['password'] = hash_password(password)
+            save_users()
+        
+        return jsonify({
+            "success": True,
+            "message": "Login successful",
+            "user": {"email": email, "fullName": user['fullName']}
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home endpoint - simple response"""
+    return jsonify({
+        "status": "Backend API Running",
+        "frontend": "http://localhost:5173",
+        "api_endpoints": "/health, /ai-chat, /predict-disease"
+    }), 200
+
+
+
+@app.route('/predict-from-report', methods=['POST'])
+def predict_from_report():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    file = request.files['file']
+    filename = file.filename
+    ext = os.path.splitext(filename)[1].lower()
+    temp_path = os.path.join(tempfile.gettempdir(), filename)
+    file.save(temp_path)
+
+    text = ""
+    if ext in ['.jpg', '.jpeg', '.png']:
+        try:
+            import pytesseract
+            from PIL import Image
+            text = pytesseract.image_to_string(Image.open(temp_path))
+        except Exception as e:
+            return jsonify({'error': f'OCR failed: {str(e)}'}), 500
+    elif ext == '.pdf':
+        try:
+            import pdfplumber
+            with pdfplumber.open(temp_path) as pdf:
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+        except Exception as e:
+            return jsonify({'error': f'PDF parsing failed: {str(e)}'}), 500
+    else:
+        return jsonify({'error': 'Unsupported file type'}), 400
+    
+        vitals = extract_vitals_from_text(text)
+        return jsonify({**vitals, 'extracted_text': text})
+    
+
+if __name__ == "__main__":
+    print("\n" + "="*50)
+    print("Rural Healthcare ML Backend".center(50))
+    print("="*50 + "\n")
+
+    # Non-blocking checks
+    try:
+        import socket
+        sock = socket.create_connection(("127.0.0.1", 11434), timeout=1)
+        sock.close()
+        print(" Ollama running")
+    except Exception:
+        print(" Ollama not reachable - start with: ollama serve")
+
+    if _NLLB_MODEL is not None:
+        print(" NLLB model loaded")
+    
+    kb = _load_local_disease_kb()
+    if kb and len(kb) > 0:
+        print(f" Disease KB loaded ({len(kb)} diseases)")
+
+    # Ensure ML prediction model is loaded (main dependency)
+    try:
+        ok = load_model()
+        if ok:
+            print(" ML prediction model loaded")
+        else:
+            print(" ⚠ ML prediction model not found or failed to load")
+    except Exception as e:
+        print(f" ⚠ Error loading ML prediction model: {e}")
+
+    print("\n Starting server on port 5000...\n")
+
+    try:
+        from waitress import serve
+        serve(app, host="127.0.0.1", port=5000, threads=4)
+    except ImportError:
+        app.run(host="127.0.0.1", port=5000, debug=False, threaded=True, use_reloader=False)

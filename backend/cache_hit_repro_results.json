@@ -1,0 +1,13 @@
+{
+  "call1_session_a": {
+    "cached": true,
+    "reply": "Malaria: High fever, chills, headache, muscle pain."
+  },
+  "call2_session_b": {
+    "cached": true,
+    "reply": "Malaria: High fever, chills, headache, muscle pain."
+  },
+  "call3_translate_followup": {
+    "reply": "मलेरियाः उच्च बुखार ठंडक सिरदर्द मांसपेशियों में दर्द ।"
+  }
+}

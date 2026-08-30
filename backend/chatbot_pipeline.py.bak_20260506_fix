@@ -1,0 +1,570 @@
+"""
+Production-ready healthcare chatbot pipeline.
+Strict, deterministic, no hallucinations.
+"""
+
+import re
+import json
+from typing import Optional, Dict, Any
+from pathlib import Path
+import ollama
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+
+
+KB_PATH = Path(__file__).parent / "disease_knowledge_base.json"
+OLLAMA_MODEL = "mistral"
+OLLAMA_TEMPERATURE = 0.3
+OLLAMA_NUM_PREDICT = 80
+NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+
+LANGUAGE_CODES = {
+    "eng_Latn": "English",
+    "hin_Deva": "Hindi",
+    "kan_Knda": "Kannada",
+}
+
+_translation_tokenizer = None
+_translation_model = None
+
+
+def limit_response_words(text: str, max_words: int = 350) -> str:
+    if not text:
+        return text
+    words = str(text).split()
+    if len(words) <= max_words:
+        return text
+    truncated = " ".join(words[:max_words])
+    last_period = max(truncated.rfind("."), truncated.rfind("!"), truncated.rfind("?"))
+    if last_period != -1:
+        return truncated[: last_period + 1]
+    else:
+        return truncated + "."
+
+
+# Session storage: {session_id: {"disease": str, "timestamp": datetime}}
+_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+# ============================================================
+# 1. NORMALIZATION
+# ============================================================
+
+FILLER_WORDS = {
+    "disease", "condition", "illness", "health", "medical", "problem",
+    "symptom", "symptoms", "sign", "signs", "about", "the", "a", "is"
+}
+
+PUNCTUATION_PATTERN = re.compile(r'[^\w\s]')
+
+
+def normalize(text: str) -> str:
+    """
+    Normalize text: lowercase, remove punctuation, strip filler words.
+    
+    Args:
+        text: Raw text to normalize
+        
+    Returns:
+        Normalized text for matching
+    """
+    if not text:
+        return ""
+    
+    # Lowercase
+    text = text.lower().strip()
+    
+    # Remove punctuation
+    text = PUNCTUATION_PATTERN.sub('', text)
+    
+    # Remove extra whitespace
+    text = ' '.join(text.split())
+    
+    # Remove filler words
+    words = [w for w in text.split() if w not in FILLER_WORDS]
+    
+    return ' '.join(words)
+
+
+# ============================================================
+# 2. KNOWLEDGE BASE LOADER
+# ============================================================
+
+def load_kb() -> Optional[Dict[str, Dict[str, str]]]:
+    """Load disease knowledge base from JSON."""
+    try:
+        if not KB_PATH.exists():
+            return None
+        
+        with open(KB_PATH, 'r', encoding='utf-8') as f:
+            kb = json.load(f)
+        
+        return kb if isinstance(kb, dict) else None
+    except Exception as e:
+        print(f"Error loading KB: {e}")
+        return None
+
+
+def load_translation_model():
+    """Load and cache the NLLB-200 translation model."""
+    global _translation_tokenizer, _translation_model
+
+    if _translation_tokenizer is not None and _translation_model is not None:
+        return _translation_tokenizer, _translation_model
+
+    tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, local_files_only=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL_NAME, local_files_only=True)
+    model.eval()
+
+    _translation_tokenizer = tokenizer
+    _translation_model = model
+    return tokenizer, model
+
+
+def translate_text(text: str, src_lang: str, tgt_lang: str) -> str:
+    """Translate text with NLLB-200 using explicit source and target language codes."""
+    if not text or src_lang == tgt_lang:
+        return text
+
+    try:
+        tokenizer, model = load_translation_model()
+        tokenizer.src_lang = src_lang
+
+        inputs = tokenizer(text, return_tensors="pt", truncation=True)
+        inputs = {key: value.to(model.device) for key, value in inputs.items()}
+        forced_bos_token_id = tokenizer.lang_code_to_id.get(tgt_lang)
+        if forced_bos_token_id is None:
+            forced_bos_token_id = tokenizer.convert_tokens_to_ids(tgt_lang)
+
+        with torch.inference_mode():
+            generated_tokens = model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_token_id,
+                max_new_tokens=256,
+            )
+
+        return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
+    except Exception:
+        return text
+
+
+def detect_language(text: str) -> str:
+    """Detect English, Hindi, or Kannada input."""
+    if not text:
+        return "eng_Latn"
+
+    for character in text:
+        code_point = ord(character)
+        if 0x0C80 <= code_point <= 0x0CFF:
+            return "kan_Knda"
+        if 0x0900 <= code_point <= 0x097F:
+            return "hin_Deva"
+    return "eng_Latn"
+
+
+TARGET_LANGUAGE_HINTS = {
+    "hin_Deva": (
+        r"\b(?:in|into|answer in|reply in|translate to|output in|respond in)\s+hindi\b",
+        r"\bhindi\s+mein\b",
+        r"\bhindi\s+me\b",
+    ),
+    "kan_Knda": (
+        r"\b(?:in|into|answer in|reply in|translate to|output in|respond in)\s+kannada\b",
+        r"\bkannada\s+mein\b",
+        r"\bkannada\s+me\b",
+    ),
+}
+
+
+def extract_target_language(text: str) -> tuple[str, Optional[str]]:
+    """Remove explicit language hints and return the cleaned text plus a target language."""
+    if not text:
+        return "", None
+
+    cleaned_text = text
+    requested_language: Optional[str] = None
+
+    for language_code, patterns in TARGET_LANGUAGE_HINTS.items():
+        for pattern in patterns:
+            if re.search(pattern, cleaned_text, flags=re.IGNORECASE):
+                requested_language = language_code
+                cleaned_text = re.sub(pattern, " ", cleaned_text, flags=re.IGNORECASE)
+
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+    return cleaned_text, requested_language
+
+
+# ============================================================
+# 3. DISEASE DETECTION
+# ============================================================
+
+def detect_disease_from_query(query: str, kb: Dict[str, Dict[str, str]]) -> Optional[str]:
+    """
+    Detect disease from query using:
+    1. Exact disease name match (normalized)
+    2. Alias match from KB
+    
+    Args:
+        query: User query
+        kb: Knowledge base
+        
+    Returns:
+        Disease name if found, None otherwise
+    """
+    if not query or not kb:
+        return None
+    
+    normalized_query = normalize(query)
+    
+    # Try exact disease name match first
+    for disease_name in kb.keys():
+        normalized_disease = normalize(disease_name)
+        
+        # Exact match or contains
+        if normalized_disease == normalized_query or normalized_disease in normalized_query:
+            return disease_name
+    
+    # Try alias match
+    for disease_name, disease_data in kb.items():
+        if not isinstance(disease_data, dict):
+            continue
+        
+        aliases = disease_data.get("aliases", [])
+        if not isinstance(aliases, list):
+            continue
+        
+        for alias in aliases:
+            normalized_alias = normalize(alias)
+            if normalized_alias == normalized_query or normalized_alias in normalized_query:
+                return disease_name
+    
+    return None
+
+
+def detect_disease(query: str, kb: Dict[str, Dict[str, str]]) -> Optional[str]:
+    """Compatibility alias for disease detection."""
+    return detect_disease_from_query(query, kb)
+
+
+# ============================================================
+# 4. INTENT DETECTION
+# ============================================================
+
+INTENT_KEYWORDS = {
+    "What is the disease?": [
+        "what is", "about", "explain", "tell me", "definition", "describe"
+    ],
+    "What are the symptoms?": [
+        "symptom", "symptoms", "sign", "signs", "show", "indicate", "present"
+    ],
+    "What causes the disease?": [
+        "cause", "causes", "why", "reason", "trigger", "origin", "source"
+    ],
+    "Prevention": [
+        "prevent", "prevention", "avoid", "avoid", "reduce", "lower", "protect"
+    ],
+    "Food": [
+        "food", "diet", "eat", "eating", "nutrition", "what to eat", "what not to eat"
+    ],
+    "How to control it?": [
+        "treat", "treatment", "control", "manage", "cure", "yoga", "exercise", "remedy"
+    ],
+    "When to see a doctor?": [
+        "doctor", "consult", "when", "see a doctor", "hospital", "emergency", "urgent"
+    ]
+}
+
+
+def detect_intent(query: str) -> str:
+    """
+    Detect user intent and map to KB field.
+    
+    Args:
+        query: User query
+        
+    Returns:
+        KB field key (intent)
+    """
+    if not query:
+        return "What is the disease?"
+    
+    query_lower = query.lower()
+    
+    # Score each intent based on keyword matches
+    scores = {}
+    for intent, keywords in INTENT_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in query_lower)
+        if score > 0:
+            scores[intent] = score
+    
+    # Return highest scoring intent, default to "What is the disease?"
+    if scores:
+        return max(scores, key=scores.get)
+    
+    return "What is the disease?"
+
+
+# ============================================================
+# 5. KB FIELD RETRIEVAL
+# ============================================================
+
+def get_kb_field(kb: Dict[str, Dict[str, str]], disease: str, intent: str) -> str:
+    """
+    Get specific field from KB for a disease.
+    
+    Args:
+        kb: Knowledge base
+        disease: Disease name
+        intent: Intent/field key
+        
+    Returns:
+        KB field content, empty string if not found
+    """
+    if not kb or not disease or not intent:
+        return ""
+    
+    disease_data = kb.get(disease)
+    if not isinstance(disease_data, dict):
+        return ""
+    
+    field_value = disease_data.get(intent, "")
+    
+    return str(field_value).strip() if field_value else ""
+
+
+# ============================================================
+# 6. SESSION MANAGEMENT
+# ============================================================
+
+def set_session_disease(session_id: str, disease: str) -> None:
+    """Store detected disease in session."""
+    if not session_id or not disease:
+        return
+    
+    from datetime import datetime
+    
+    if session_id not in _SESSIONS:
+        _SESSIONS[session_id] = {}
+    
+    _SESSIONS[session_id]["disease"] = disease
+    _SESSIONS[session_id]["timestamp"] = datetime.now()
+
+
+def get_session_disease(session_id: str) -> Optional[str]:
+    """Retrieve last detected disease from session."""
+    if not session_id or session_id not in _SESSIONS:
+        return None
+    
+    return _SESSIONS[session_id].get("disease")
+
+
+def clear_session(session_id: str) -> None:
+    """Clear session data."""
+    _SESSIONS.pop(session_id, None)
+
+
+# ============================================================
+# 7. OLLAMA (MISTRAL) CALL
+# ============================================================
+
+SYSTEM_PROMPT = """You are a healthcare assistant for rural communities.
+
+Rules:
+* Answer ONLY using the given context
+* Keep answer short (2–4 lines maximum)
+* Answer directly (yes/no if applicable)
+* Do NOT add extra information
+* Do NOT guess or make up information
+* If information is insufficient, recommend consulting a doctor"""
+
+
+def call_ollama(query: str, context: str) -> Optional[str]:
+    """
+    Call Ollama Mistral with strict formatting rules.
+    
+    Args:
+        query: User question
+        context: KB context to use
+        
+    Returns:
+        Formatted response from Mistral
+    """
+    if not query or not context:
+        return None
+    
+    prompt = f"""Context:
+{context}
+
+User question:
+{query}
+
+Answer:"""
+    
+    try:
+        # Updated system prompt to enforce word limits and concision
+        system_msg = (
+            "You are a strict healthcare assistant. "
+            "Answer in maximum 3 sentences only. "
+            "Keep response strictly under 300 words. Be direct and concise."
+        )
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+            options={
+                "num_predict": OLLAMA_NUM_PREDICT,
+                "temperature": OLLAMA_TEMPERATURE,
+            },
+        )
+
+        answer = response.get("response", "") if response else ""
+        answer = (answer or "").strip()
+        if not answer:
+            return None
+        # Enforce Mistral word limit (300 words)
+        return limit_response_words(answer, 300)
+    except Exception:
+        return None
+
+
+# ============================================================
+# 8. MAIN PIPELINE
+# ============================================================
+
+def process_query(
+    query: str,
+    session_id: str = "default",
+    predicted_disease: Optional[str] = None
+) -> str:
+    """
+    Main chatbot pipeline: strict, deterministic, no hallucinations.
+    
+    Args:
+        query: User question
+        session_id: Session ID for memory
+        predicted_disease: Optional disease from ML model
+        
+    Returns:
+        Safe, KB-only response
+    """
+    
+    # Load KB
+    kb = load_kb()
+    if not kb:
+        return "Knowledge base unavailable. Please try again later."
+    
+    # ============================================================
+    # STEP 1: DETECT DISEASE
+    # ============================================================
+    
+    disease = predicted_disease or detect_disease(query, kb) or get_session_disease(session_id)
+
+    if not disease:
+        return "Please specify a disease or symptom (e.g., 'symptoms of dengue'). This helps me give accurate information."
+
+    set_session_disease(session_id, disease)
+
+    if disease not in kb:
+        return f"I don't have information about '{disease}' in my database. Please consult a doctor."
+
+    intent = detect_intent(query)
+    context = get_kb_field(kb, disease, intent)
+    if not context:
+        return f"Information about '{intent.lower()}' for {disease} is not available. Please consult a doctor."
+
+    response = call_ollama(query, context)
+
+    # Tier 1 - Knowledge base fallback
+    if not response:
+        kb_reply = f"{disease}: {context}"
+        return limit_response_words(kb_reply, 350)
+
+    # Detect follow-up (short question heuristic) and emergency intent
+    is_followup = len(str(query or "").split()) <= 14
+    intent_lower = str(intent or "").lower()
+    is_emergency = "emergency" in intent_lower or "when to see a doctor" in intent_lower
+
+    # Apply appropriate limits
+    if is_emergency:
+        response = limit_response_words(response, 150)
+        if not response.strip().endswith("Please visit a doctor immediately."):
+            response = response.strip() + " Please visit a doctor immediately."
+    elif is_followup:
+        response = limit_response_words(response, 200)
+    else:
+        # Mistral responses: already limited in call_ollama but enforce again
+        response = limit_response_words(response, 300)
+
+    return response
+
+
+def multilingual_chatbot(
+    user_input: Optional[str] = None,
+    session_id: str = "default",
+    query: Optional[str] = None,
+    predicted_disease: Optional[str] = None,
+) -> str:
+    """
+    Multilingual wrapper around the strict English pipeline.
+
+    Flow:
+    - detect language
+    - translate non-English input to English
+    - call the existing ML -> KB -> Mistral pipeline
+    - translate the response back to the requested language when needed
+    """
+    incoming_text = user_input if user_input is not None else query
+    if incoming_text is None:
+        return "Please specify the disease (e.g., 'symptoms of dengue')."
+
+    cleaned_input, requested_target_language = extract_target_language(incoming_text)
+    original_language = detect_language(cleaned_input)
+    target_language = requested_target_language or original_language
+    english_input = cleaned_input
+
+    if original_language != "eng_Latn":
+        english_input = translate_text(cleaned_input, original_language, "eng_Latn")
+
+    english_response = process_query(
+        english_input,
+        session_id=session_id,
+        predicted_disease=predicted_disease,
+    )
+
+    if target_language != "eng_Latn" and english_response:
+        return translate_text(english_response, "eng_Latn", target_language)
+
+    return english_response
+
+
+# ============================================================
+# TESTING & DEBUG
+# ============================================================
+
+if __name__ == "__main__":
+    # Test normalize
+    print("=== TEST: normalize ===")
+    print(normalize("What is the disease about COVID"))
+    print()
+    
+    # Test KB load
+    print("=== TEST: load_kb ===")
+    kb = load_kb()
+    if kb:
+        print(f"KB loaded: {len(kb)} diseases")
+    print()
+    
+    # Test detect_intent
+    print("=== TEST: detect_intent ===")
+    print(detect_intent("What are the symptoms?"))
+    print(detect_intent("Tell me about food"))
+    print(detect_intent("When should I see a doctor?"))
+    print()
+    
+    # Test main pipeline
+    print("=== TEST: process_query ===")
+    result = process_query("What are the symptoms of malaria?")
+    print(result)

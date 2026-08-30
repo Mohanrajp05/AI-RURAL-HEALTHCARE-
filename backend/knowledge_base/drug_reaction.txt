@@ -1,0 +1,21 @@
+# Drug Reaction
+
+**Source:** https://en.wikipedia.org/wiki/Adverse_drug_reaction
+
+## Symptoms
+Information not found on the source page for this field.
+
+## Causes
+Medical condition Adverse drug reaction A rash due to a drug reaction An adverse drug reaction ( ADR ) is an unintended medical event, which can potentially be associated with taking a medication . ADRs may occur following a single dose or prolonged administration of a drug or may result from the combination of two or more drugs. Approximately 2.8% of all ADEs present on admission and 4.4% of ADEs that originated during a hospital stay were caused by a sedative or hypnotic drug.
+
+## Prevention
+Congenital abnormality Requires intervention to prevent permanent impairment or damage Severity is a measure of the intensity of the adverse event in question.
+
+## Treatment
+Causality assessment is used to determine the likelihood that a drug caused a suspected ADR. [ 3 ] There are a number of different methods used to judge causation, including the Naranjo algorithm , the Venulet algorithm and the WHO causality term assessment criteria. Each have pros and cons associated with their use and most require some level of expert judgement to apply. [ 30 ] An ADR should not be labeled as 'certain' unless the ADR abates with a challenge-dechallenge-rechallenge protocol (stopping and starting the agent in question). [ 3 ] The chronology of the onset of the suspected ADR is important, as another substance or factor may be implicated as a cause; co-prescribed medications and underlying psychiatric conditions may be factors in the ADR. [ 3 ] Assigning causality to a specific agent often proves difficult, unless the event is found during a clinical study or large databases are used. Both methods have difficulties and can be fraught with error. Even in clinical studies, some ADRs may be missed as large numbers of test individuals are required to find a specific adverse drug reaction, especially for rare ADRs. Psychiatric ADRs are often missed as they are grouped together in the questionnaires used to assess the population. [ 31 ] [ 32 ] Many countries have official bodies that monitor drug safety and reactions. On an international level, the WHO runs the Uppsala Monitoring Centre . [ 33 ] The European Union runs the European Medicines Agency (EMA). [ 34 ] In the United States , the Food and Drug Administration (FDA) is responsible for monitoring post-marketing studies. [ 35 ] The FDA has a reporting system called the FDA Adverse Event Reporting System , where individuals can report adverse drug events. [ 35 ] Healthcare professionals, consumers, and the pharmaceutical industry can all submit information to this system. [ 35 ] For health products marketed in Canada , a branch of Health Canada called The Canada Vigilance Program is responsible for surveillance. [ 36 ] Both healthcare professionals and consumers can report to this program. [ 36 ] In Australia , the Therapeutic Goods Administration (TGA) conducts postmarket monitoring of therapeutic products. [ 37 ] In the UK, a monitoring system called the Yellow Card Scheme was established in 1964. [ 38 ] The Yellow Card Scheme was set up to surveil medications and other health products. [ 39 ]
+
+## Diet Recommendations
+Information not found on the source page for this field.
+
+## When To See A Doctor
+Information not found on the source page for this field.

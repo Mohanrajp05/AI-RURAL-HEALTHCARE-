@@ -1,0 +1,177 @@
+/** @import must precede all other statements */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+
+  
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 210 15% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 210 15% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 210 15% 15%;
+
+    --primary: 158 71% 46%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 200 78% 56%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 210 8% 92%;
+    --muted-foreground: 210 6% 48%;
+
+    --accent: 170 85% 49%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 85% 56%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 210 8% 90%;
+    --input: 210 8% 95%;
+    --ring: 158 71% 46%;
+
+    --radius: 0.75rem;
+
+    --sidebar-background: 0 0% 98%;
+
+    --sidebar-foreground: 210 15% 15%;
+
+    --sidebar-primary: 158 71% 46%;
+
+    --sidebar-primary-foreground: 0 0% 100%;
+
+    --sidebar-accent: 170 85% 49%;
+
+    --sidebar-accent-foreground: 0 0% 100%;
+
+    --sidebar-border: 210 8% 90%;
+
+    --sidebar-ring: 158 71% 46%;
+  }
+
+  .dark {
+    --background: 210 15% 10%;
+    --foreground: 210 8% 92%;
+
+    --card: 210 15% 15%;
+    --card-foreground: 210 8% 92%;
+
+    --popover: 210 15% 15%;
+    --popover-foreground: 210 8% 92%;
+
+    --primary: 158 71% 46%;
+    --primary-foreground: 210 15% 10%;
+
+    --secondary: 200 78% 56%;
+    --secondary-foreground: 210 15% 10%;
+
+    --muted: 210 15% 25%;
+    --muted-foreground: 210 8% 70%;
+
+    --accent: 170 85% 49%;
+    --accent-foreground: 210 15% 10%;
+
+    --destructive: 0 85% 56%;
+    --destructive-foreground: 210 15% 10%;
+
+    --border: 210 15% 25%;
+    --input: 210 15% 20%;
+    --ring: 158 71% 46%;
+    --sidebar-background: 210 15% 12%;
+    --sidebar-foreground: 210 8% 92%;
+    --sidebar-primary: 158 71% 46%;
+    --sidebar-primary-foreground: 210 15% 10%;
+    --sidebar-accent: 170 85% 49%;
+    --sidebar-accent-foreground: 210 15% 10%;
+    --sidebar-border: 210 15% 25%;
+    --sidebar-ring: 158 71% 46%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  :where(p, span, li, h1, h2, h3, h4, h5, h6, a, button, label, td, th) {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  pre,
+  code {
+    overflow-x: auto;
+    white-space: pre;
+  }
+}
+
+/* Styles for formatted bot message bubbles */
+.bot-message-bubble {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  text-align: left;
+  line-height: 1.65;
+  letter-spacing: 0.01em;
+}
+
+.bot-message-bubble p {
+  margin: 0 0 0.7rem 0;
+}
+
+.bot-message-bubble p:last-child {
+  margin-bottom: 0;
+}
+
+.bot-message-bubble ul {
+  margin: 0.2rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.bot-message-bubble li {
+  margin-bottom: 0.45rem;
+}
+
+.chat-input {
+  flex: 1;
+  min-height: 44px;
+  max-height: 120px;
+  padding: 11px 14px;
+  border: 1.5px solid #10b981;
+  border-radius: 22px;
+  font-size: 13px;
+  background: hsl(var(--input));
+  color: hsl(var(--foreground));
+  outline: none;
+  resize: none;
+  overflow-y: auto;
+  word-wrap: break-word;
+  word-break: break-word;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  font-family: inherit;
+  scrollbar-width: thin;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.chat-input:focus {
+  border-color: #10b981;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.1);
+}
+
+.chat-input::placeholder {
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+}
