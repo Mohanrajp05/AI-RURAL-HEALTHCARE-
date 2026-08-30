@@ -5172,17 +5172,28 @@ if __name__ == "__main__":
 
     threading.Thread(target=_prewarm_all_models, daemon=True).start()
 
-    # Fast (no model loading), so done synchronously rather than in the
-    # background prewarm thread above.
-    try:
-        mysql_store.init_schema()
-        # One-time backfills from the old JSON fallback files into MySQL --
-        # all three are no-ops once the corresponding table already has data.
-        load_users()
-        migrate_patients_json_to_mysql()
-        migrate_chat_store_json_to_mysql()
-    except Exception as exc:
-        print(f"[mysql_store] startup init failed: {exc}")
+    # Backgrounded (not run synchronously here) so a slow/unreachable
+    # MySQL can NEVER delay the port bind below -- a bad/missing SSL CA
+    # file was previously observed to make the connection attempt stall
+    # well past Render's port-scan timeout, with the process never even
+    # reaching serve()/app.run(). mysql_store's own functions already
+    # degrade to no-ops when MySQL is unavailable (see _get_pool()), so
+    # nothing downstream depends on this having finished by the time the
+    # server starts accepting requests -- worst case, the first few
+    # requests hit the JSON-file fallback path until this completes.
+    def _init_mysql_background():
+        try:
+            mysql_store.init_schema()
+            # One-time backfills from the old JSON fallback files into
+            # MySQL -- all three are no-ops once the corresponding table
+            # already has data.
+            load_users()
+            migrate_patients_json_to_mysql()
+            migrate_chat_store_json_to_mysql()
+        except Exception as exc:
+            print(f"[mysql_store] startup init failed: {exc}")
+
+    threading.Thread(target=_init_mysql_background, daemon=True).start()
 
     kb = _load_local_disease_kb()
     if kb and len(kb) > 0:

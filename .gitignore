@@ -34,6 +34,12 @@ dist-ssr
 # API Keys and credentials
 *.key
 *.pem
+# Exception: backend/ca.pem is Aiven's PUBLIC CA certificate for the
+# MySQL SSL connection (mysql_store.py's MYSQL_SSL_CA) -- a public cert,
+# not a private key, and it must be committed or Render's deploy has no
+# CA file to reference at all (this was the actual cause of a startup
+# hang that delayed port-binding past Render's port-scan timeout).
+!backend/ca.pem
 secrets.json
 credentials.json
 .aws/

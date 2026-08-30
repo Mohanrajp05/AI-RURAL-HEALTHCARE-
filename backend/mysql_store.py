@@ -12,7 +12,17 @@ MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
 MYSQL_USER = os.environ.get("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "rural_healthcare")
-MYSQL_SSL_CA = os.environ.get("MYSQL_SSL_CA", "ca.pem")
+
+# Resolved relative to THIS file's directory, not the process's current
+# working directory -- a bare "ca.pem" only worked when the app happened
+# to be launched from inside backend/. Render's Start Command working
+# directory isn't guaranteed to match that, and when the CA file can't be
+# found at all (it was previously never even committed -- see .gitignore
+# history) mysql.connector's SSL handshake stalls rather than failing
+# fast, which was long enough to blow past Render's port-scan timeout
+# before the app ever got to bind a port.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MYSQL_SSL_CA = os.environ.get("MYSQL_SSL_CA", os.path.join(_BASE_DIR, "ca.pem"))
 
 _pool = None
 _pool_init_failed = False
@@ -28,8 +38,21 @@ def _get_pool():
     if _pool_init_failed:
         return None
     try:
-        import mysql.connector
         from mysql.connector import pooling
+
+        # A missing/unreadable CA file has been observed to make the SSL
+        # handshake stall rather than fail fast, even with
+        # connection_timeout set -- check for it ourselves first so a
+        # misconfiguration is a clear, immediate log line instead of a
+        # multi-minute hang (this is what previously delayed Flask from
+        # ever binding a port on Render, well past its port-scan timeout).
+        ssl_kwargs = {}
+        if MYSQL_SSL_CA and os.path.isfile(MYSQL_SSL_CA):
+            ssl_kwargs = {"ssl_ca": MYSQL_SSL_CA, "ssl_verify_cert": True}
+        elif MYSQL_SSL_CA:
+            print(f"[mysql_store] WARNING: MYSQL_SSL_CA={MYSQL_SSL_CA!r} not found -- "
+                  f"connecting without CA verification (Aiven still requires TLS; "
+                  f"this only skips verifying its identity)")
 
         _pool = pooling.MySQLConnectionPool(
             pool_name="rural_healthcare_pool",
@@ -40,8 +63,7 @@ def _get_pool():
             password=MYSQL_PASSWORD,
             database=MYSQL_DATABASE,
             connection_timeout=5,
-            ssl_ca=MYSQL_SSL_CA,
-            ssl_verify_cert=True,
+            **ssl_kwargs,
         )
         return _pool
     except Exception as exc:
