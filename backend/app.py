@@ -1,5 +1,20 @@
 import os
 import sys
+
+# CRITICAL, must run before anything else: Python fully block-buffers
+# stdout when it isn't attached to a terminal (exactly Render's case --
+# it pipes the process's output into its log collector). Every print()
+# in this file and every module it imports could genuinely be running
+# and still show up as total silence in Render's log viewer until that
+# buffer fills or the process exits, making a real hang and a merely-
+# slow-but-working startup look identical. Line-buffering (flush on
+# every \n) makes every print below actually observable in real time,
+# without needing flush=True threaded through every call site.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+print("[startup] 0. app.py module execution started (imports below)", flush=True)
+
 import time
 import smtplib
 import tempfile
@@ -34,6 +49,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+print("[startup] 1. stdlib/flask imports done, importing chatbot_response "
+      "+ chatbot_pipeline (pulls in torch/transformers -- can be slow)...", flush=True)
 from chatbot_response import (
     chatbot_response,
     clear_chat_session,
@@ -45,6 +62,7 @@ from chatbot_response import (
 from chatbot_pipeline import multilingual_chatbot as pipeline_process_query
 from chatbot_pipeline import new_diag as _new_pipeline_diag
 from chatbot_pipeline import run_startup_selftest as _run_pipeline_selftest
+print("[startup] 2. chatbot_pipeline imported (torch/transformers loaded)", flush=True)
 
 # NEW guarded disease-prediction pipeline (40-symptom MultiLabelBinarizer +
 # RF/NB/SVM ensemble). Imports are lazy-safe: appliance only loads the
@@ -55,6 +73,7 @@ from predict_disease_guarded import (
     TOKEN_TO_CHECKBOX as _NEW_TOKEN_TO_CHECKBOX,
     load_models as _new_load_models,
 )
+print("[startup] 3. predict_disease_guarded imported", flush=True)
 
 # Risk-level classification: disease clinical severity x model confidence.
 from risk_classification import compute_risk_level as _compute_risk_level
@@ -65,6 +84,7 @@ import guardrails
 import ai_gateway
 import cache as chat_cache
 import portkey_llm
+print("[startup] 4. guardrails/ai_gateway/cache/portkey_llm imported", flush=True)
 
 from file_extractor import (
     extract_text as _extract_file_text,
@@ -76,6 +96,7 @@ from file_extractor import (
 # "nearest hospital" requests and the high-risk-assessment-upload offer.
 # See /hospitals/nearby below.
 import hospital_search
+print("[startup] 5. file_extractor/hospital_search imported", flush=True)
 
 # MySQL is the only database this app talks to (MongoDB was removed --
 # patients, legacy_users, chat_conversations/messages/usage, rag_chat_log
@@ -84,6 +105,7 @@ import hospital_search
 # straight from Supabase Auth via supabase_admin.py (see /api/users).
 import mysql_store
 import supabase_admin
+print("[startup] 6. mysql_store/supabase_admin imported -- all imports done", flush=True)
 
 # Uploaded chat attachments are stored temporarily under backend/uploads/
 # (deleted automatically after 24 hours; only the extracted text persists in
