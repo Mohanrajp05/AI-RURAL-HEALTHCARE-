@@ -5209,8 +5209,20 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"CRITICAL: startup self-test itself raised {type(exc).__name__}: {exc}")
 
-    print("\n Starting server on port 5001...\n")
-    print(" Running on http://127.0.0.1:5001\n")
+    # Render (and most PaaS hosts) assign their own port at runtime via the
+    # PORT env var and route external traffic to it -- a hardcoded port
+    # would simply not be listening on the right one. 0.0.0.0 (not
+    # 127.0.0.1) is required too: 127.0.0.1 only accepts connections from
+    # inside the same machine, but the platform's load balancer connects
+    # from outside the container. Falls back to 5001/127.0.0.1 behavior
+    # locally when PORT isn't set (unset HOST_BIND keeps local runs exactly
+    # as before, in case 0.0.0.0 ever needs to be avoided in a given dev
+    # environment).
+    PORT = int(os.environ.get("PORT", 5001))
+    HOST = os.environ.get("HOST_BIND", "0.0.0.0")
+
+    print(f"\n Starting server on port {PORT}...\n")
+    print(f" Running on http://{HOST}:{PORT}\n")
 
     try:
         from waitress import serve
@@ -5224,7 +5236,7 @@ if __name__ == "__main__":
         # either way, so this doesn't add real parallelism -- it just stops
         # short requests from queueing behind unrelated slow ones purely for
         # lack of a worker thread to run on.
-        serve(app, host="127.0.0.1", port=5001, threads=16)
+        serve(app, host=HOST, port=PORT, threads=16)
     except ImportError:
-        app.run(host="127.0.0.1", port=5001, debug=False, threaded=True, use_reloader=False)
+        app.run(host=HOST, port=PORT, debug=False, threaded=True, use_reloader=False)
 
