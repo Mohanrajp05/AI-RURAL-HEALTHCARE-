@@ -5162,6 +5162,21 @@ if __name__ == "__main__":
     # time avoids that race entirely; each step still logs its own timing so
     # this isn't slower to observe, just serialized.
     def _prewarm_all_models():
+        # RAG/FAISS first: this is the model that was previously loaded
+        # EAGERLY at chatbot_pipeline.py import time (module-level
+        # init_rag() call) -- an unguarded HuggingFaceEmbeddings() load
+        # with no local_files_only guard, no timeout, and (on Render's
+        # ephemeral filesystem) no local cache to short-circuit a network
+        # fetch. That's what silently stalled startup before Flask ever
+        # bound a port. Now backgrounded like every other heavy model here.
+        print("[startup] 2a. About to load RAG/FAISS embedding model", flush=True)
+        try:
+            from chatbot_pipeline import preload_rag
+            preload_rag()
+        except Exception as exc:
+            print(f"[RAG] pre-warm failed: {exc}")
+        print("[startup] 2b. RAG/FAISS embedding model step done", flush=True)
+
         try:
             from speech_service import _get_model
             _get_model()

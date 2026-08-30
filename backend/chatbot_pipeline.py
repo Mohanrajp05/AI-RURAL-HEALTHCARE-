@@ -247,8 +247,33 @@ def _compose_faiss_context(chunks: list) -> str:
     return "\n\n".join(blocks).strip()
 
 
-# Load the FAISS index + embedding model once at startup (best-effort).
-init_rag()
+# NOT called eagerly here anymore -- init_rag() does an unguarded
+# HuggingFaceEmbeddings(model_name=...) load (unlike load_translation_model()
+# below, which passes local_files_only=True). On a host where that model
+# isn't already cached on disk (e.g. Render's ephemeral filesystem -- a
+# fresh container on every deploy, nothing persisted between them), that
+# call falls through to a live HuggingFace Hub download with no timeout of
+# its own. Running it at MODULE IMPORT time -- before Flask ever binds a
+# port -- turned any slowness/stall in that download into what looked
+# exactly like a silent, unrecoverable startup hang (this was the actual
+# cause of the "no open ports detected" / zero-log-output incident: nothing
+# after "[portkey_config] Loaded N provider target(s)" ever printed because
+# nothing after it had run yet). See preload_rag() below -- same call,
+# moved into the background prewarm thread (app.py's _prewarm_all_models),
+# which runs AFTER the port is already bound. retrieve_faiss_chunks() also
+# still calls init_rag() lazily on first actual use either way, so RAG
+# still works correctly even if the background preload hasn't finished yet
+# or fails outright.
+
+
+def preload_rag():
+    """Warm the FAISS index + embedding model once at server startup
+    (background thread) -- see the comment above for why this moved out of
+    eager module-level execution."""
+    try:
+        init_rag()
+    except Exception as exc:
+        print(f"[RAG] preload failed ({exc!r}); will load on demand.")
 
 
 def load_translation_model():
