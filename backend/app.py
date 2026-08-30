@@ -136,6 +136,16 @@ except ValueError:
 app = Flask(__name__)
 CORS(app)
 
+# Set once ALL heavy startup work (ML models, KB/index loading, MySQL
+# schema init, model prewarming) finishes in the background thread started
+# at the bottom of this file -- see load_heavy_resources(). The port is
+# bound and Flask starts accepting connections BEFORE this is set, so
+# Render's port scan succeeds immediately regardless of how long any of
+# that background work takes. Routes that have a genuine hard dependency
+# on it (see /predict) check this and return 503 instead of erroring on
+# an unloaded model.
+app_ready = threading.Event()
+
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 
 
@@ -3215,6 +3225,19 @@ def predict():
         "symptoms": [list of symptom strings]
     }
     """
+    # Genuine hard dependency: the RF/NB/SVM ensemble (predict_disease_
+    # guarded.py) loads in the background load_heavy_resources() thread,
+    # not at import time. Unlike /ai-chat's pipeline (which already
+    # degrades gracefully -- lazy-loads RAG/translation inline, falls back
+    # through KB tiers), a prediction with no loaded model is just wrong,
+    # not merely slower -- so this one actually needs the hard 503 gate.
+    if not app_ready.is_set():
+        return jsonify({
+            "disease": "Error",
+            "risk": 0,
+            "error": "The server is still starting up. Please try again in about 30 seconds."
+        }), 503
+
     try:
         data, uploaded_report = get_request_data()
 
@@ -3682,6 +3705,12 @@ def health():
 
         return jsonify({
             "status": "ok",
+            # True once load_heavy_resources() (background thread started
+            # at server startup) has finished ML/KB/MySQL init. Render only
+            # needs SOMETHING to answer on the port -- 200 either way, this
+            # field is for anyone polling readiness specifically, not for
+            # Render's own port scan.
+            "app_ready": app_ready.is_set(),
             "memory_mb": round(memory_mb, 2),
             "active_sessions": active_sessions,
             "max_sessions": MAX_SESSIONS,
@@ -5118,12 +5147,22 @@ def asr():
         return jsonify({"error": f"ASR failed: {exc}"}), 500
 
 
-if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("Rural Healthcare ML Backend".center(50))
-    print("="*50 + "\n")
+# ===== ALL heavy startup work lives here now, run in ONE background =====
+# ===== thread AFTER the port is already bound (see __main__ below).  =====
+# Previously this was a mix of eager module-level code (chatbot_pipeline's
+# init_rag()) and synchronous code here BEFORE serve()/app.run() -- meaning
+# Render's port scanner had to wait for ALL of it before the port ever
+# opened, and whichever piece was slow (or silently stalled -- the missing
+# ca.pem, the network-dependent embedding model download) caused a
+# "no open ports detected" deploy timeout. Rather than keep chasing
+# individual slow steps one at a time, EVERYTHING that does real work
+# (network calls, model loading, disk I/O beyond a few KB, DB connections)
+# is consolidated here and started in a background thread; the main thread
+# binds the port immediately afterward regardless of how long this takes.
+def load_heavy_resources():
+    print("[background] Starting heavy resource loading...", flush=True)
 
-    # Non-blocking checks
+    # Non-blocking checks -- Ollama/ASR status, informational only.
     try:
         import socket
         sock = socket.create_connection(("127.0.0.1", 11434), timeout=1)
@@ -5150,93 +5189,26 @@ if __name__ == "__main__":
     except Exception:
         print(" ASR unavailable")
 
-    # Pre-warm every heavy model in ONE background thread, sequentially, so
-    # startup stays non-blocking without racing multiple transformers
-    # `from_pretrained()` calls against each other. transformers' low-CPU-
-    # memory load path materializes weights via a temporary meta-device
-    # context; that context is not safe to enter from multiple threads at
-    # once, and doing so was observed to corrupt EVERY subsequent model call
-    # in the process (IT2 *and* its NLLB fallback both failing forever with
-    # "Tensor on device meta is not on the expected device cpu!", silently
-    # leaving every non-English reply untranslated). Loading one model at a
-    # time avoids that race entirely; each step still logs its own timing so
-    # this isn't slower to observe, just serialized.
-    def _prewarm_all_models():
-        # RAG/FAISS first: this is the model that was previously loaded
-        # EAGERLY at chatbot_pipeline.py import time (module-level
-        # init_rag() call) -- an unguarded HuggingFaceEmbeddings() load
-        # with no local_files_only guard, no timeout, and (on Render's
-        # ephemeral filesystem) no local cache to short-circuit a network
-        # fetch. That's what silently stalled startup before Flask ever
-        # bound a port. Now backgrounded like every other heavy model here.
-        print("[startup] 2a. About to load RAG/FAISS embedding model", flush=True)
-        try:
-            from chatbot_pipeline import preload_rag
-            preload_rag()
-        except Exception as exc:
-            print(f"[RAG] pre-warm failed: {exc}")
-        print("[startup] 2b. RAG/FAISS embedding model step done", flush=True)
+    # MySQL schema init + one-time JSON backfills. mysql_store's own
+    # functions already degrade to no-ops when MySQL is unavailable (see
+    # _get_pool()), so nothing downstream hard-depends on this finishing --
+    # worst case, the first few requests hit the JSON-file fallback path.
+    try:
+        mysql_store.init_schema()
+        load_users()
+        migrate_patients_json_to_mysql()
+        migrate_chat_store_json_to_mysql()
+    except Exception as exc:
+        print(f"[mysql_store] startup init failed: {exc}")
 
-        try:
-            from speech_service import _get_model
-            _get_model()
-            print("[ASR] model pre-warmed in background")
-        except Exception as exc:
-            print(f"[ASR] pre-warm failed: {exc}")
-
-        try:
-            from translation_service import preload as _it2_preload
-            _it2_preload()
-        except Exception as exc:
-            print(f"[Translate] pre-warm failed: {exc}")
-        try:
-            from chatbot_pipeline import preload_translation
-            preload_translation()
-        except Exception as exc:
-            print(f"[Translate] NLLB pre-warm failed: {exc}")
-
-        try:
-            from tts_service import preload as _tts_preload
-            _tts_preload()
-        except Exception as exc:
-            print(f"[tts] pre-warm failed: {exc}")
-
-        try:
-            from faq_matcher import prewarm_semantic
-            prewarm_semantic()
-        except Exception as exc:
-            print(f"[faq_matcher] pre-warm failed: {exc}")
-
-    threading.Thread(target=_prewarm_all_models, daemon=True).start()
-
-    # Backgrounded (not run synchronously here) so a slow/unreachable
-    # MySQL can NEVER delay the port bind below -- a bad/missing SSL CA
-    # file was previously observed to make the connection attempt stall
-    # well past Render's port-scan timeout, with the process never even
-    # reaching serve()/app.run(). mysql_store's own functions already
-    # degrade to no-ops when MySQL is unavailable (see _get_pool()), so
-    # nothing downstream depends on this having finished by the time the
-    # server starts accepting requests -- worst case, the first few
-    # requests hit the JSON-file fallback path until this completes.
-    def _init_mysql_background():
-        try:
-            mysql_store.init_schema()
-            # One-time backfills from the old JSON fallback files into
-            # MySQL -- all three are no-ops once the corresponding table
-            # already has data.
-            load_users()
-            migrate_patients_json_to_mysql()
-            migrate_chat_store_json_to_mysql()
-        except Exception as exc:
-            print(f"[mysql_store] startup init failed: {exc}")
-
-    threading.Thread(target=_init_mysql_background, daemon=True).start()
-
+    # Local disease KB (small JSON read) + the guarded 40-symptom RF/NB/SVM
+    # ensemble (predict_disease_guarded.py's joblib models) -- the /predict
+    # route has a genuine hard dependency on the latter, see its app_ready
+    # check below.
     kb = _load_local_disease_kb()
     if kb and len(kb) > 0:
         print(f" Disease KB loaded ({len(kb)} diseases)")
 
- 
     try:
         ok, err = load_guarded_pipeline()
         if ok:
@@ -5247,15 +5219,64 @@ if __name__ == "__main__":
         print(f" WARNING Error loading guarded prediction pipeline: {e}")
 
     # ===== STARTUP SELF-TEST (Step 5a, pipeline audit 2026-08-24) =====
-    # Runs automatically every startup -- catches FAQ/KB fast-path
-    # regressions the moment they're introduced instead of only surfacing
-    # as a silent production incident that burns Portkey quota. Loud
-    # CRITICAL banner on failure; never blocks startup (a broken selftest
-    # should be impossible to miss, not a crash).
+    # Catches FAQ/KB fast-path regressions the moment they're introduced.
+    # Loud CRITICAL banner on failure; never blocks startup.
     try:
         _run_pipeline_selftest()
     except Exception as exc:
         print(f"CRITICAL: startup self-test itself raised {type(exc).__name__}: {exc}")
+
+    # Heavy ML models, loaded one at a time (not in parallel): transformers'
+    # low-CPU-memory load path materializes weights via a temporary
+    # meta-device context that is not safe to enter from multiple threads
+    # at once -- doing so was observed to corrupt EVERY subsequent model
+    # call in the process (IT2 *and* its NLLB fallback both failing forever
+    # with "Tensor on device meta is not on the expected device cpu!").
+    print("[background] Loading RAG/FAISS embedding model...", flush=True)
+    try:
+        from chatbot_pipeline import preload_rag
+        preload_rag()
+    except Exception as exc:
+        print(f"[RAG] pre-warm failed: {exc}")
+
+    try:
+        from speech_service import _get_model
+        _get_model()
+        print("[ASR] model pre-warmed in background")
+    except Exception as exc:
+        print(f"[ASR] pre-warm failed: {exc}")
+
+    try:
+        from translation_service import preload as _it2_preload
+        _it2_preload()
+    except Exception as exc:
+        print(f"[Translate] pre-warm failed: {exc}")
+    try:
+        from chatbot_pipeline import preload_translation
+        preload_translation()
+    except Exception as exc:
+        print(f"[Translate] NLLB pre-warm failed: {exc}")
+
+    try:
+        from tts_service import preload as _tts_preload
+        _tts_preload()
+    except Exception as exc:
+        print(f"[tts] pre-warm failed: {exc}")
+
+    try:
+        from faq_matcher import prewarm_semantic
+        prewarm_semantic()
+    except Exception as exc:
+        print(f"[faq_matcher] pre-warm failed: {exc}")
+
+    app_ready.set()
+    print("[background] All heavy resources loaded. App fully ready.", flush=True)
+
+
+if __name__ == "__main__":
+    print("\n" + "="*50)
+    print("Rural Healthcare ML Backend".center(50))
+    print("="*50 + "\n")
 
     # Render (and most PaaS hosts) assign their own port at runtime via the
     # PORT env var and route external traffic to it -- a hardcoded port
@@ -5263,13 +5284,15 @@ if __name__ == "__main__":
     # 127.0.0.1) is required too: 127.0.0.1 only accepts connections from
     # inside the same machine, but the platform's load balancer connects
     # from outside the container. Falls back to 5001/127.0.0.1 behavior
-    # locally when PORT isn't set (unset HOST_BIND keeps local runs exactly
-    # as before, in case 0.0.0.0 ever needs to be avoided in a given dev
-    # environment).
+    # locally when PORT isn't set.
     PORT = int(os.environ.get("PORT", 5001))
     HOST = os.environ.get("HOST_BIND", "0.0.0.0")
 
-    print(f"\n Starting server on port {PORT}...\n")
+    # Start heavy loading in the background FIRST -- does NOT block the
+    # main thread from binding the port immediately after.
+    threading.Thread(target=load_heavy_resources, daemon=True).start()
+
+    print(f"[startup] Binding port {PORT} now", flush=True)
     print(f" Running on http://{HOST}:{PORT}\n")
 
     try:
