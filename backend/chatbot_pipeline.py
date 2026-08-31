@@ -10,13 +10,21 @@ import difflib
 from functools import lru_cache
 from typing import Optional, Dict, Any
 from pathlib import Path
+print("[cp-import] a. importing ollama", flush=True)
 import ollama
+print("[cp-import] b. importing torch", flush=True)
 import torch
+print("[cp-import] c. importing transformers (AutoModelForSeq2SeqLM/AutoTokenizer)", flush=True)
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+print("[cp-import] d. transformers imported", flush=True)
 
+print("[cp-import] e. importing portkey_llm", flush=True)
 import portkey_llm
+print("[cp-import] f. importing llm_router", flush=True)
 import llm_router
+print("[cp-import] g. importing faq_matcher (pulls in sklearn)", flush=True)
 from faq_matcher import match_faq
+print("[cp-import] h. faq_matcher imported", flush=True)
 
 
 

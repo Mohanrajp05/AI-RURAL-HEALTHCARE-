@@ -21,8 +21,11 @@ import difflib
 import os
 import re
 
+print("[llm_router-import] importing requests", flush=True)
 import requests
+print("[llm_router-import] importing portkey_ai SDK", flush=True)
 from portkey_ai import Portkey
+print("[llm_router-import] portkey_ai imported", flush=True)
 
 from doc_chunker import retrieve_relevant_chunks
 

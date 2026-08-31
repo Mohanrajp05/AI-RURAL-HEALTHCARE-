@@ -5,11 +5,17 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
+print("[cr-import] a. importing ollama", flush=True)
 import ollama
+print("[cr-import] b. importing torch", flush=True)
 import torch
+print("[cr-import] c. importing transformers (AutoModelForSeq2SeqLM/AutoTokenizer)", flush=True)
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+print("[cr-import] d. transformers imported", flush=True)
 
+print("[cr-import] e. importing portkey_llm", flush=True)
 import portkey_llm
+print("[cr-import] f. portkey_llm imported", flush=True)
 
 OLLAMA_MODEL = "cniongolo/biomistral:latest"
 NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"

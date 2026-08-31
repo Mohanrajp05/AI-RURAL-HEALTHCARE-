@@ -17,8 +17,10 @@ import json
 import os
 import re
 
+print("[faq_matcher-import] importing sklearn (TfidfVectorizer/cosine_similarity)", flush=True)
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+print("[faq_matcher-import] sklearn imported", flush=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAQ_INDEX_PATH = os.path.join(BASE_DIR, "knowledge_base", "faq_index.json")
