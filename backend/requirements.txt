@@ -17,8 +17,8 @@ scikit-learn==1.5.0
 # which breaks IndicTrans2's remote-code IndicTransTokenizer (it sets
 # self.unk_token before calling super().__init__()). 4.57.1 is the latest
 # pre-5.0 release that still loads IndicTrans2 correctly under this pin.
-# (MMS-TTS/VitsModel -- see tts_service.py -- is natively supported by
-# transformers, no remote code, so it isn't a factor in this pin.)
+# (tts_service.py no longer uses transformers at all -- it's gTTS now, a
+# plain cloud HTTP call -- so it isn't a factor in this pin either.)
 transformers==4.57.1
 # Plain `pip install -r requirements.txt` grabs the CPU-only wheel on
 # Windows, which silently runs IndicTrans2 on CPU float32
@@ -38,7 +38,13 @@ ollama>=0.1.0
 portkey-ai>=2.3.4
 psutil>=5.9.0
 waitress>=2.2.0
-faster-whisper>=1.0.0
+# faster-whisper (local ASR) removed -- speech_service.py now calls Groq's
+# cloud Whisper API directly over HTTPS via `requests` (already a dep
+# above), so no local model/torch/ctranslate2 is needed for voice input.
+# gTTS: tts_service.py's cloud TTS fallback for languages the browser's own
+# Web Speech API can't speak (commonly Kannada/Tamil/Telugu) -- a plain
+# HTTPS call to Google Translate's TTS endpoint, no local model.
+gTTS>=2.5.0
 python-docx>=1.1.0
 openpyxl>=3.1.0
 python-pptx>=1.0.0

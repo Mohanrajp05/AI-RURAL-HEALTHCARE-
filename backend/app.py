@@ -81,15 +81,17 @@ CHAT_MODULES_READY = threading.Event()
 # true (set this in Render's dashboard env vars, NOT local .env, so local
 # dev keeps the full local-model path by default) skips every eager
 # torch-dependent preload below in load_heavy_resources() -- RAG/FAISS
-# semantic retrieval, IndicTrans2/NLLB translation, and MMS-TTS. Each of
-# those has its own SKIP_LOCAL_ML check in its own module too (chatbot_
-# pipeline.init_rag, translation_service.translate/preload, tts_service.
-# synthesize/preload), so they stay disabled even if something calls them
-# directly instead of through here. Translation still works when this flag
-# is set -- translation_service.translate() routes through Portkey/Gemini
-# instead. The core chat path (guardrails -> FAQ/KB matcher, sklearn-based
-# and lightweight -> Portkey) is unaffected either way; ASR (faster-
-# whisper/ctranslate2) doesn't use torch and is also unaffected.
+# semantic retrieval and IndicTrans2/NLLB translation. Each of those has its
+# own SKIP_LOCAL_ML check in its own module too (chatbot_pipeline.init_rag,
+# translation_service.translate/preload), so they stay disabled even if
+# something calls them directly instead of through here. Translation still
+# works when this flag is set -- translation_service.translate() routes
+# through Portkey/Gemini instead. The core chat path (guardrails -> FAQ/KB
+# matcher, sklearn-based and lightweight -> Portkey) is unaffected either
+# way. Neither ASR (speech_service.py, Groq's hosted Whisper API) nor TTS
+# (tts_service.py, gTTS) has a local model anymore -- both are plain HTTPS
+# calls -- so neither needs a SKIP_LOCAL_ML gate and
+# runs unconditionally regardless of this flag.
 SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
 
 print("[startup] 2. chatbot_response/chatbot_pipeline import deferred to background thread"
@@ -3780,7 +3782,7 @@ def health():
             "asr": {
                 "available": _asr["loaded"],
                 "model": _asr["model"],
-                "vad": _asr["vad"],
+                "backend": _asr.get("backend"),
                 "error": _asr.get("error"),
             },
             "message": "Backend API Running"
@@ -5156,10 +5158,14 @@ def tts_voices():
 
 @app.route('/api/tts', methods=['POST'])
 def tts_speak():
-    """Synthesize speech from text using the local MMS-TTS models.
+    """Synthesize speech from text via gTTS (Google's cloud TTS -- no local
+    model, see tts_service.py). This is the frontend's automatic fallback
+    for languages the browser's own Web Speech API can't speak (commonly
+    Kannada/Tamil/Telugu); English/Hindi usually speak directly in-browser
+    and never reach this route at all.
 
     Request:  { "text": "string", "language": "kn" }
-    Response: audio/wav binary body, or JSON error.
+    Response: audio/mpeg (MP3) binary body, or JSON error.
     """
     data = request.get_json(silent=True) or {}
     text = str(data.get("text", "")).strip()
@@ -5173,21 +5179,24 @@ def tts_speak():
     try:
         from tts_service import synthesize
 
-        wav_bytes, sample_rate = synthesize(text, language)
-        return Response(wav_bytes, mimetype="audio/wav")
+        mp3_bytes, _sample_rate = synthesize(text, language)
+        return Response(mp3_bytes, mimetype="audio/mpeg")
     except Exception as exc:
-        print(f"[tts] MMS-TTS error: {exc}")
+        print(f"[tts] gTTS error: {exc}")
         import traceback; traceback.print_exc()
         return jsonify({"error": f"TTS failed: {exc}"}), 500
 
 
 @app.route('/api/asr', methods=['POST'])
 def asr():
-    """Transcribe uploaded audio to text using Faster-Whisper (local ASR).
+    """Transcribe uploaded audio to text via Groq's cloud Whisper API.
+
+    No local model/torch involved -- see speech_service.py.
 
     Request:  multipart/form-data
               "audio"    (file, required): wav/mp3/m4a/webm/ogg/flac/...
               "language" (str, optional):  ISO-639-1 code to force detection
+                          (en/hi/kn/ta/te)
     Response: { "text": str, "language": str, "confidence": float }
     """
     file = request.files.get("audio")
@@ -5231,11 +5240,12 @@ def load_heavy_resources():
     global _SESSION_HISTORY, pipeline_process_query, _new_pipeline_diag, _run_pipeline_selftest
     print(f"[background] Starting heavy resource loading... (SKIP_LOCAL_ML={SKIP_LOCAL_ML})", flush=True)
     if SKIP_LOCAL_ML:
-        print("[background] SKIP_LOCAL_ML=true -- RAG/FAISS, IndicTrans2/NLLB "
-              "translation, and MMS-TTS preloads below are no-ops (each has "
-              "its own SKIP_LOCAL_ML guard in its own module: chatbot_"
-              "pipeline.init_rag, translation_service.preload/translate, "
-              "tts_service.preload/synthesize). Chat still works in full "
+        print("[background] SKIP_LOCAL_ML=true -- RAG/FAISS and IndicTrans2/"
+              "NLLB translation preloads below are no-ops (each has its own "
+              "SKIP_LOCAL_ML guard in its own module: chatbot_pipeline."
+              "init_rag, translation_service.preload/translate). TTS "
+              "(tts_service.py, gTTS) has no local model and isn't gated by "
+              "this flag either way. Chat still works in full "
               "(guardrails -> FAQ/KB matcher -> Portkey), and translation "
               "routes through Portkey/Gemini instead of a local model.",
               flush=True)
@@ -5303,7 +5313,7 @@ def load_heavy_resources():
     try:
         from speech_service import asr_status
         _asr = asr_status()
-        print(f" ASR ready ({_asr['model']}, lazy load)" if _asr["loaded"] else f" ASR configured ({_asr['model']}, loads on first request)")
+        print(f" ASR ready (Groq cloud {_asr['model']})" if _asr["loaded"] else f" ASR NOT configured: {_asr['error']}")
     except Exception:
         print(" ASR unavailable")
 
@@ -5358,11 +5368,14 @@ def load_heavy_resources():
         print(f"[RAG] pre-warm failed: {exc}")
 
     try:
-        from speech_service import _get_model
-        _get_model()
-        print("[ASR] model pre-warmed in background")
+        from speech_service import asr_status
+        _asr = asr_status()
+        if _asr["loaded"]:
+            print(f"[ASR] Groq cloud Whisper configured ({_asr['model']}), no local model to warm")
+        else:
+            print(f"[ASR] WARNING {_asr['error']} -- /api/asr will fail until it is set")
     except Exception as exc:
-        print(f"[ASR] pre-warm failed: {exc}")
+        print(f"[ASR] status check failed: {exc}")
 
     try:
         from translation_service import preload as _it2_preload
@@ -5416,15 +5429,18 @@ if __name__ == "__main__":
     try:
         from waitress import serve
         # threads=4 meant only 4 requests could even be ACCEPTED at once --
-        # with TTS calls routinely taking 30-160s+ (this hardware has no
-        # GPU), 4 slow TTS/audio-mode requests could occupy every worker
-        # thread, leaving an unrelated, otherwise-fast translation request
-        # stuck waiting for a free thread rather than for the (separate)
-        # translation lock it actually needs. The CPU-bound work itself is
-        # still fully serialized by TRANSLATE_LOCK / tts_service._lock
-        # either way, so this doesn't add real parallelism -- it just stops
-        # short requests from queueing behind unrelated slow ones purely for
-        # lack of a worker thread to run on.
+        # with local TTS calls historically taking 30-160s+ (this hardware
+        # had no GPU), 4 slow TTS/audio-mode requests could occupy every
+        # worker thread, leaving an unrelated, otherwise-fast translation
+        # request stuck waiting for a free thread rather than for the
+        # (separate) translation lock it actually needs. The CPU-bound
+        # translation work is still fully serialized by TRANSLATE_LOCK
+        # either way, so raising this doesn't add real parallelism there --
+        # it just stops short requests from queueing behind unrelated slow
+        # ones purely for lack of a worker thread to run on. (TTS itself is
+        # gTTS now -- a ~0.5-1s cloud call, no longer the bottleneck this
+        # was written for -- but 16 threads is still the right number for
+        # the translation case above.)
         serve(app, host=HOST, port=PORT, threads=16)
     except ImportError:
         app.run(host=HOST, port=PORT, debug=False, threaded=True, use_reloader=False)

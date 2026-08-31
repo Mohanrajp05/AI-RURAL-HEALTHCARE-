@@ -93,10 +93,23 @@ const ALLOWED_ATTACHMENT_EXTENSIONS = new Set([
 const ATTACHMENT_ACCEPT = Array.from(ALLOWED_ATTACHMENT_EXTENSIONS).join(",");
 const TTS_ENABLED_STORAGE_KEY = "aiAssistant.ttsEnabled";
 
-// Voice input (mic) is restricted to English only -- the TTS dropdown lists
-// several reply languages, but the mic button is disabled/blocked for all of
-// them except English.
-const ASR_SUPPORTED_LANGUAGES = new Set(["en"]);
+// Voice input (mic) is transcribed by Groq's cloud Whisper API (see
+// backend /api/asr -> speech_service.py), which natively supports every
+// reply language this app offers.
+const ASR_SUPPORTED_LANGUAGES = new Set(["en", "hi", "kn", "ta", "te"]);
+
+// BCP-47 tags for the browser's built-in speechSynthesis (client-side TTS,
+// see speakText/speakUtterance below) -- matches the same 5 languages ASR
+// and the reply-language dropdown use.
+const SPEECH_SYNTHESIS_LANG_CODES: Record<string, string> = {
+  en: "en-US",
+  hi: "hi-IN",
+  kn: "kn-IN",
+  ta: "ta-IN",
+  te: "te-IN",
+};
+const getLanguageCode = (language: string): string =>
+  SPEECH_SYNTHESIS_LANG_CODES[language] || "en-US";
 
 // A recording stopped before this many ms in has too few (or zero) actual
 // audio frames for the backend decoder to read -- it fails with a raw
@@ -745,13 +758,15 @@ export default function AIAssistant() {
     window.setTimeout(() => window.print(), 50);
   };
 
-  // Voice input (speech-to-text): recorded in-browser and transcribed by the
-  // backend Faster-Whisper service via POST /api/asr.
+  // Voice input (speech-to-text): recorded in-browser and transcribed by
+  // Groq's cloud Whisper API via POST /api/asr (backend/speech_service.py) --
+  // no local model, so this works for every reply language.
   const [listening, setListening] = useState(false);
   const [asrBusy, setAsrBusy] = useState(false);
   const [micError, setMicError] = useState("");
 
-  // Indic-Mio text-to-speech (backend /api/tts).
+  // Text-to-speech: the browser's own built-in speechSynthesis, entirely
+  // client-side -- no backend call, no memory cost on the server.
   // ttsEnabled controls AUTOPLAY of new incoming replies only (persisted so it
   // survives reloads); it never gates the per-message speaker buttons below.
   const [ttsEnabled, setTtsEnabled] = useState<boolean>(() => {
@@ -776,40 +791,43 @@ export default function AIAssistant() {
   const [ttsLanguage, setTtsLanguage] = useState("en");
   const [languages, setLanguages] = useState<Record<string, string>>({ en: "English" });
   // speakingTs: message.ts whose audio is currently PLAYING (shows the stop icon).
-  // loadingTs: message.ts currently FETCHING audio (shows a spinner). Kept
-  // separate and per-message so a slow synth for one message never makes
-  // every other message's speaker icon appear to be loading too.
+  // loadingTs: message.ts currently fetching the cloud-TTS fallback (see
+  // playBackendAudio below) -- the browser-voice path is instant and never
+  // sets this.
   const [speakingTs, setSpeakingTs] = useState<number | null>(null);
   const [loadingTs, setLoadingTs] = useState<number | null>(null);
   // ttsError: last playback failure, shown to the user instead of silently
-  // doing nothing (audio.play() rejections used to be swallowed entirely).
+  // doing nothing.
   const [ttsError, setTtsError] = useState("");
-  // blockedTs: a message whose audio is already fetched/loaded but whose
-  // play() call was refused by the browser (see ttsError). The SAME Audio
-  // object is kept in audioRef so a follow-up click can retry play()
-  // synchronously, inside the click handler, with no intervening await --
-  // that's what lets the retry succeed where the first attempt didn't.
+  // blockedTs: a message whose fallback audio is fetched/loaded but whose
+  // play() call was refused by the browser (autoplay policy). The SAME Audio
+  // object stays in audioRef so a follow-up click can retry play()
+  // synchronously, inside the click handler -- that's what lets the retry
+  // succeed where the first (post-await) attempt didn't.
   const [blockedTs, setBlockedTs] = useState<number | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  // Holds the <audio> element for the gTTS cloud-fallback path only -- the
+  // browser-voice path never touches this.
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Monotonic token that invalidates any in-flight TTS work (synthesis fetch
-  // or queued utterance) whenever speaking is stopped or a new message is
-  // clicked, so only the most recent speakText() call can ever produce audio.
+  // Cache of window.speechSynthesis.getVoices(): populated immediately and
+  // refreshed on the "voiceschanged" event, since Chrome loads the voice
+  // list asynchronously (it's often empty on the very first call).
+  const speechVoicesRef = useRef<SpeechSynthesisVoice[]>([]);
+
+  // Monotonic token that invalidates any in-flight TTS work (a queued
+  // utterance) whenever speaking is stopped or a new message is clicked, so
+  // only the most recent speakText() call can ever produce audio.
   const ttsTokenRef = useRef(0);
 
-  // Auto-play (ttsEnabled) queue: TTS synthesis on this backend can take
-  // 30-60s+ per message, which is much slower than replies normally arrive.
-  // Auto-play used to call speakText() directly, and speakText() always
-  // cancels whatever the previous call was doing -- so in any conversation
-  // faster-paced than ~1 message/minute, each new reply silently threw away
-  // the still-synthesizing audio for the reply before it, and only the very
-  // last message (if the user then paused) ever actually played. Queuing
-  // auto-play messages instead lets every reply's audio play in order.
+  // Auto-play (ttsEnabled) queue: speaking one message can outlast the next
+  // reply arriving, so auto-play messages are queued (not spoken directly)
+  // to make sure every reply's audio plays in order instead of the newest
+  // reply cancelling whatever the previous one was still saying.
   const autoQueueRef = useRef<{ text: string; ts: number }[]>([]);
   const autoQueueBusyRef = useRef(false);
 
@@ -857,6 +875,22 @@ export default function AIAssistant() {
     };
   }, []);
 
+  // Chrome (and some other browsers) load the speechSynthesis voice list
+  // asynchronously -- it's often empty on the very first call, populated
+  // moments later via the "voiceschanged" event. Cache it eagerly and keep
+  // it fresh so findVoiceForLanguage() below has real data to check against.
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+    const loadVoices = () => {
+      speechVoicesRef.current = window.speechSynthesis.getVoices();
+    };
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+    };
+  }, []);
+
   // Persist the header Audio toggle across sessions (autoplay preference only).
   useEffect(() => {
     try {
@@ -867,200 +901,93 @@ export default function AIAssistant() {
   }, [ttsEnabled]);
 
   const stopSpeaking = () => {
-    // Bumping the token invalidates ANY in-flight synth/utterance from a
+    // Bumping the token invalidates ANY in-flight utterance/fetch from a
     // previous speakText() call -- this is what lets a click on message #4
     // abort message #1's still-loading/still-playing audio.
     ttsTokenRef.current += 1;
     // A manual interrupt also abandons any still-pending auto-play messages
     // rather than have them start playing right after.
     autoQueueRef.current = [];
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
       audioRef.current = null;
     }
-    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     setSpeakingTs(null);
     setLoadingTs(null);
     setBlockedTs(null);
     setTtsError("");
   };
 
-  // Helper shared by speakText/speakOne's catch blocks: turn a play()
-  // rejection into a message the user can actually act on, instead of the
-  // previous behavior of catching it and doing nothing visible at all.
-  const describePlaybackError = (err: unknown): string => {
-    if (err instanceof DOMException && err.name === "NotAllowedError") {
-      return "Your browser blocked audio playback. Tap the speaker icon again to play it.";
-    }
-    return `Couldn't play audio${err instanceof Error && err.message ? `: ${err.message}` : "."}`;
+  // Finds a system voice matching `langCode` (exact match first, then just
+  // the base language e.g. "hi" for "hi-IN"). Returns null both when no
+  // matching voice exists AND when the voice list hasn't loaded yet -- the
+  // caller only treats it as "unavailable" once speechVoicesRef is known to
+  // be populated (see hasKnownVoiceGap below).
+  const findVoiceForLanguage = (langCode: string): SpeechSynthesisVoice | null => {
+    const voices = speechVoicesRef.current;
+    if (!voices.length) return null;
+    const lower = langCode.toLowerCase();
+    return (
+      voices.find((v) => v.lang.toLowerCase() === lower) ||
+      voices.find((v) => v.lang.toLowerCase().startsWith(lower.split("-")[0])) ||
+      null
+    );
   };
 
-  const synthesize = async (text: string, language: string): Promise<string | null> => {
-    try {
-      const resp = await fetch(`${BACKEND}/api/tts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, language }),
-      });
-      if (!resp.ok) return null;
-      const blob = await resp.blob();
-      return URL.createObjectURL(blob);
-    } catch {
-      return null;
-    }
-  };
+  // True only when the voice list is known (non-empty) AND definitively has
+  // no match -- distinguishes "genuinely unsupported" from "hasn't loaded
+  // yet", so the cloud fallback below only fires on a real gap, not a
+  // still-loading voice list.
+  const hasKnownVoiceGap = (langCode: string): boolean =>
+    speechVoicesRef.current.length > 0 && !findVoiceForLanguage(langCode);
 
-  // Fires exactly ONE /api/tts request, scoped to this single message (text +
-  // ts). Any previous request/utterance is aborted first via stopSpeaking(),
-  // and loadingTs/speakingTs are tracked per-message-ts so only the message
-  // that was actually clicked ever shows a spinner or a "speaking" state.
-  const speakText = async (text: string, ts: number) => {
-    stopSpeaking();
-    const token = ttsTokenRef.current;
-    setLoadingTs(ts);
-
-    const url = await synthesize(text, ttsLanguage);
-    if (token !== ttsTokenRef.current) {
-      // A newer speakText()/stopSpeaking() superseded this one: discard the
-      // pending audio so it can never play or be queued after the new message.
-      if (url) URL.revokeObjectURL(url);
-      return;
-    }
-    setLoadingTs(null);
-
-    if (!url) {
-      // Fallback to the browser's built-in speech synthesis if Indic-Mio is unavailable.
-      if ("speechSynthesis" in window) {
-        const utterance = new SpeechSynthesisUtterance(text);
-        utterance.lang = ttsLanguage === "en" ? "en-US" : ttsLanguage;
-        utterance.onstart = () => {
-          if (token === ttsTokenRef.current) setSpeakingTs(ts);
-        };
-        utterance.onend = () => {
-          if (token === ttsTokenRef.current) setSpeakingTs(null);
-        };
-        utterance.onerror = () => {
-          if (token === ttsTokenRef.current) {
-            setSpeakingTs(null);
-            setTtsError("Couldn't play audio using this browser's built-in voice either.");
-          }
-        };
-        window.speechSynthesis.speak(utterance);
-      } else {
-        setTtsError("Couldn't reach the text-to-speech service, and this browser has no built-in voice to fall back to.");
-      }
-      return;
-    }
-
-    const audio = new Audio(url);
-    audioRef.current = audio;
-    setSpeakingTs(ts);
-    audio.onended = () => {
-      if (token !== ttsTokenRef.current) return;
-      URL.revokeObjectURL(url);
-      audioRef.current = null;
-      setSpeakingTs(null);
-    };
-    audio.onerror = () => {
-      if (token !== ttsTokenRef.current) return;
-      URL.revokeObjectURL(url);
-      audioRef.current = null;
-      setSpeakingTs(null);
-      setTtsError("Couldn't play the generated audio (corrupt or unsupported response).");
-    };
-    try {
-      await audio.play();
-    } catch (err) {
-      if (token === ttsTokenRef.current) {
-        setSpeakingTs(null);
-        // Deliberately do NOT clear audioRef/revoke the URL here: the audio
-        // is already fetched and loaded, so a direct follow-up click (see
-        // retryBlockedAudio) can call play() synchronously and succeed even
-        // when this first attempt -- which only reached play() after an
-        // async fetch -- was refused.
-        setBlockedTs(ts);
-        setTtsError(describePlaybackError(err));
-      }
-    }
-  };
-
-  // Retries playback for a message already flagged as blocked, WITHOUT
-  // re-fetching -- audioRef.current is the same loaded Audio object from
-  // the attempt in speakText/speakOne. Calling .play() here happens
-  // synchronously inside the click handler (no await beforehand), which is
-  // exactly the "direct result of a user gesture" browsers require.
-  const retryBlockedAudio = async (ts: number) => {
-    const audio = audioRef.current;
-    if (!audio) {
-      setBlockedTs(null);
-      return;
-    }
-    try {
-      await audio.play();
-      setSpeakingTs(ts);
-      setBlockedTs(null);
-      setTtsError("");
-    } catch (err) {
-      setTtsError(
-        "Still blocked by the browser. Check that this tab/site isn't muted " +
-          "(right-click the browser tab, or check the sound icon in the address bar)."
-      );
-    }
-  };
-
-  // Auto-play version of speakText: synthesizes + plays one message and
-  // resolves only once playback finishes (or fails/is interrupted), so
-  // processAutoQueue can await it before starting the next queued message.
-  // Unlike speakText, this never calls stopSpeaking() itself -- it only
-  // checks the token it was handed, so it neither cancels nor is cancelled
-  // by sibling queue items, only by an actual user-driven interrupt.
-  const speakOne = (text: string, ts: number, token: number): Promise<void> =>
+  // Cloud TTS fallback (backend /api/tts -> gTTS, see tts_service.py) for
+  // when the browser has no installed voice for `ttsLanguage` -- commonly
+  // Kannada/Tamil/Telugu on Windows Chrome/Edge, which ship English (and
+  // often Hindi) voices but not those three. No local model on the backend
+  // either (gTTS is a plain cloud HTTPS call), so this stays within the
+  // same "no local memory" constraint as the browser-voice path.
+  const playBackendAudio = (text: string, ts: number, token: number): Promise<void> =>
     new Promise((resolve) => {
       (async () => {
-        if (token !== ttsTokenRef.current) return resolve();
         setLoadingTs(ts);
-        const url = await synthesize(text, ttsLanguage);
-        if (token !== ttsTokenRef.current) {
-          if (url) URL.revokeObjectURL(url);
+        let url: string | null = null;
+        try {
+          const resp = await fetch(`${BACKEND}/api/tts`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text, language: ttsLanguage }),
+          });
+          if (token !== ttsTokenRef.current) return resolve();
+          if (!resp.ok) {
+            setLoadingTs(null);
+            setTtsError(
+              `Couldn't generate spoken audio for ${languages[ttsLanguage] || ttsLanguage} right now. Please try again.`
+            );
+            return resolve();
+          }
+          const blob = await resp.blob();
+          if (token !== ttsTokenRef.current) return resolve();
+          url = URL.createObjectURL(blob);
+        } catch {
+          if (token === ttsTokenRef.current) {
+            setLoadingTs(null);
+            setTtsError("Couldn't reach the text-to-speech service. Please try again.");
+          }
           return resolve();
         }
         setLoadingTs(null);
 
-        if (!url) {
-          if ("speechSynthesis" in window) {
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.lang = ttsLanguage === "en" ? "en-US" : ttsLanguage;
-            const done = () => {
-              if (token === ttsTokenRef.current) setSpeakingTs(null);
-              resolve();
-            };
-            utterance.onstart = () => {
-              if (token === ttsTokenRef.current) setSpeakingTs(ts);
-            };
-            utterance.onend = done;
-            utterance.onerror = done;
-            window.speechSynthesis.speak(utterance);
-          } else {
-            resolve();
-          }
-          return;
-        }
-
         const audio = new Audio(url);
         audioRef.current = audio;
         setSpeakingTs(ts);
-        // settled guards against double-cleanup: stopSpeaking() calls
-        // audio.pause() directly (no onended/onerror), so without an
-        // onpause handler too, a manual stop mid-auto-play would leave this
-        // promise unresolved forever -- permanently stalling the queue for
-        // the rest of the session. Natural end-of-playback also fires
-        // "pause" just before "ended", so both paths can call done().
         let settled = false;
         const done = () => {
           if (settled) return;
           settled = true;
-          URL.revokeObjectURL(url);
+          if (url) URL.revokeObjectURL(url);
           if (audioRef.current === audio) audioRef.current = null;
           if (token === ttsTokenRef.current) setSpeakingTs(null);
           resolve();
@@ -1073,25 +1000,108 @@ export default function AIAssistant() {
         } catch (err) {
           if (token === ttsTokenRef.current) {
             setSpeakingTs(null);
+            // Deliberately do NOT clear audioRef/revoke the URL here: the
+            // audio is already fetched and loaded, so a direct follow-up
+            // click (retryBlockedAudio) can call play() synchronously and
+            // succeed even when this attempt -- which only reached play()
+            // after an async fetch -- was refused by the browser's autoplay
+            // policy. `settled` stays false, so the eventual
+            // onended/onpause/onerror still runs the real cleanup once.
             setBlockedTs(ts);
-            setTtsError(describePlaybackError(err));
-            // Once one autoplay attempt is blocked, every remaining queued
-            // message will be blocked the same way until a real user
-            // gesture unlocks media playback for this tab -- drop the rest
-            // instead of spending ~10s synthesizing audio for each just to
-            // have it refused too. The user can retry this one manually.
-            autoQueueRef.current = [];
+            setTtsError(
+              err instanceof DOMException && err.name === "NotAllowedError"
+                ? "Your browser blocked audio playback. Tap the speaker icon again to play it."
+                : `Couldn't play audio${err instanceof Error && err.message ? `: ${err.message}` : "."}`
+            );
           }
-          // Deliberately skip done() here: it would revoke the URL and
-          // clear audioRef, but retryBlockedAudio() needs this exact loaded
-          // Audio object to retry play() directly from a click. `settled`
-          // stays false, so the eventual onended/onpause/onerror -- once
-          // the user stops it or a retry actually plays it through -- still
-          // runs the real cleanup exactly once.
           resolve();
         }
       })();
     });
+
+  // Retries playback for a message already flagged as blocked, WITHOUT
+  // re-fetching -- audioRef.current is the same loaded Audio object from
+  // playBackendAudio's attempt. Calling .play() here happens synchronously
+  // inside the click handler (no await beforehand), which is exactly the
+  // "direct result of a user gesture" browsers require.
+  const retryBlockedAudio = async (ts: number) => {
+    const audio = audioRef.current;
+    if (!audio) {
+      setBlockedTs(null);
+      return;
+    }
+    try {
+      await audio.play();
+      setSpeakingTs(ts);
+      setBlockedTs(null);
+      setTtsError("");
+    } catch {
+      setTtsError(
+        "Still blocked by the browser. Check that this tab/site isn't muted " +
+          "(right-click the browser tab, or check the sound icon in the address bar)."
+      );
+    }
+  };
+
+  // Speaks one message, preferring the browser's own built-in speechSynthesis
+  // (free, instant, zero backend call) and falling back to cloud TTS
+  // (playBackendAudio) only when the browser has no voice for ttsLanguage.
+  // Resolves once playback finishes (or fails/is interrupted). `token` is
+  // the ttsTokenRef snapshot at call time, so a later stopSpeaking()/newer
+  // speakText() call makes every state update here a no-op.
+  const speakUtterance = (text: string, ts: number, token: number): Promise<void> => {
+    if (!("speechSynthesis" in window)) {
+      return playBackendAudio(text, ts, token);
+    }
+
+    const langCode = getLanguageCode(ttsLanguage);
+    if (hasKnownVoiceGap(langCode)) {
+      return playBackendAudio(text, ts, token);
+    }
+
+    return new Promise((resolve) => {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = langCode;
+      const voice = findVoiceForLanguage(langCode);
+      if (voice) utterance.voice = voice;
+
+      const done = () => {
+        if (token === ttsTokenRef.current) setSpeakingTs(null);
+        resolve();
+      };
+      utterance.onstart = () => {
+        if (token === ttsTokenRef.current) setSpeakingTs(ts);
+      };
+      utterance.onend = done;
+      utterance.onerror = (event) => {
+        if (token !== ttsTokenRef.current) {
+          resolve();
+          return;
+        }
+        // A handful of browsers report a missing voice at speak-time
+        // instead of (or in addition to) leaving it out of getVoices() --
+        // fall back to the cloud instead of just erroring in that case too.
+        if (event.error === "language-unavailable" || event.error === "voice-unavailable" || event.error === "synthesis-unavailable" || event.error === "synthesis-failed") {
+          resolve(playBackendAudio(text, ts, token));
+          return;
+        }
+        if (event.error !== "canceled" && event.error !== "interrupted") {
+          setTtsError("Couldn't play audio using this browser's built-in voice.");
+        }
+        done();
+      };
+      window.speechSynthesis.speak(utterance);
+    });
+  };
+
+  // Speaks exactly one message (text + ts), scoped by speakUtterance's own
+  // token check so clicking a different message's speaker icon cleanly
+  // supersedes this one.
+  const speakText = async (text: string, ts: number) => {
+    stopSpeaking();
+    const token = ttsTokenRef.current;
+    await speakUtterance(text, ts, token);
+  };
 
   // Drains autoQueueRef one message at a time (only one instance ever runs,
   // guarded by autoQueueBusyRef) so simultaneous replies queue up instead of
@@ -1104,7 +1114,7 @@ export default function AIAssistant() {
         const token = ttsTokenRef.current;
         const next = autoQueueRef.current.shift();
         if (!next) break;
-        await speakOne(next.text, next.ts, token);
+        await speakUtterance(next.text, next.ts, token);
         if (token !== ttsTokenRef.current) {
           // A manual stop/interrupt happened mid-queue -- drop the rest.
           autoQueueRef.current = [];
@@ -1152,7 +1162,7 @@ export default function AIAssistant() {
     if (!ASR_SUPPORTED_LANGUAGES.has(ttsLanguage)) {
       const name = languages[ttsLanguage] || ttsLanguage;
       setMicError(
-        `Voice input (mic) is only available in English. Switch the language back to English to use the mic, or type your question in ${name} instead.`
+        `Voice input (mic) isn't available for ${name} yet. Type your question instead.`
       );
       return;
     }
@@ -1788,7 +1798,6 @@ export default function AIAssistant() {
       setAsrBusy(false);
       setMicError("");
       setSpeakingTs(null);
-      setLoadingTs(null);
       removeAttachment();
       refreshConversations();
       textareaRef.current?.focus();
@@ -1821,7 +1830,6 @@ export default function AIAssistant() {
       setAsrBusy(false);
       setMicError("");
       setSpeakingTs(null);
-      setLoadingTs(null);
       removeAttachment();
       textareaRef.current?.focus();
     }
@@ -2334,10 +2342,7 @@ export default function AIAssistant() {
                               // from this click -- see retryBlockedAudio's comment.
                               void retryBlockedAudio(message.ts);
                             } else {
-                              void speakText(message.text, message.ts).catch(() => {
-                                setSpeakingTs(null);
-                                setLoadingTs(null);
-                              });
+                              void speakText(message.text, message.ts);
                             }
                           }}
                           aria-label={
@@ -2356,7 +2361,7 @@ export default function AIAssistant() {
                               ? "Loading audio..."
                               : blockedTs === message.ts
                               ? "Browser blocked playback -- tap to retry"
-                              : "Speak reply (Indic-Mio TTS)"
+                              : "Speak reply"
                           }
                           className={`inline-flex h-8 w-8 items-center justify-center rounded-full border transition-colors ${
                             speakingTs === message.ts
@@ -2514,14 +2519,14 @@ export default function AIAssistant() {
                     ? "Stop voice input"
                     : ASR_SUPPORTED_LANGUAGES.has(ttsLanguage)
                     ? "Start voice input"
-                    : "Voice input is only available in English"
+                    : `Voice input isn't available for ${languages[ttsLanguage] || ttsLanguage}`
                 }
                 title={
                   listening
                     ? "Stop voice input"
                     : ASR_SUPPORTED_LANGUAGES.has(ttsLanguage)
                     ? "Start voice input"
-                    : "Voice input (mic) is only available in English"
+                    : `Voice input isn't available for ${languages[ttsLanguage] || ttsLanguage}`
                 }
                 className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                   listening
@@ -2697,9 +2702,9 @@ export default function AIAssistant() {
                     <Mic className="h-4 w-4 text-emerald-600" /> Voice &amp; language
                   </h3>
                   <ul className="list-disc space-y-1 pl-5">
-                    <li>Type your question, or use the mic button to speak it -- mic input works in English only</li>
+                    <li>Type your question, or use the mic button to speak it -- works in English, Hindi, Kannada, Tamil, and Telugu</li>
                     <li>Pick a reply language from the dropdown to get answers in that language</li>
-                    <li>Tap the speaker icon on any reply to hear it read aloud</li>
+                    <li>Tap the speaker icon on any reply to hear it read aloud using your browser's voice</li>
                   </ul>
                 </section>
 
