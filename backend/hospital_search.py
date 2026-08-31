@@ -49,9 +49,16 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # interpreter against their own copy of OSM data and are tried in order
 # after the primary, so one being blocked/down doesn't take hospital search
 # down with it.
+#
+# overpass.osm.ch is listed first: verified independently reachable (own
+# server, own IP range, unrelated to overpass-api.de's block). kumi.systems
+# is kept as a second attempt, but note it and overpass.private.coffee
+# (deliberately NOT both listed here) are the same physical host
+# ("flanders.servers.private.coffee") -- listing both would have added a
+# second retry, not a second independent mirror.
 OVERPASS_FALLBACK_URLS = [
+    "https://overpass.osm.ch/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
 ]
 
 # Both services' fair-use policies ask that a client identify itself and not
