@@ -2,14 +2,31 @@
 import math
 import os
 import re
+import socket
 import threading
 import time
 
 import requests
+import urllib3.util.connection as _urllib3_conn
 
 from env_loader import load_env_file
 
 load_env_file()
+
+# overpass-api.de (and, less often, nominatim.openstreetmap.org) publish both
+# AAAA and A records. Many cloud hosts (Render's free tier included) have no
+# outbound IPv6 route at all, so a getaddrinfo() that hands back the IPv6
+# address first makes the very first connect() attempt fail immediately with
+# "[Errno 101] Network is unreachable" -- urllib3 does try the remaining
+# addresses from getaddrinfo, but on some of these hosts every address
+# resolves to an unreachable family, so the request never gets a chance to
+# reach the working IPv4 address at all. Forcing IPv4-only resolution here
+# sidesteps the whole class of failure; both services are reachable over
+# IPv4, so this costs nothing. Process-wide (not just this module's session)
+# since urllib3.util.connection is a shared import, but that's fine -- every
+# other outbound call in this app (Portkey, Groq, Supabase, Aiven) is IPv4-
+# reachable too.
+_urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
 
 # ---------------------------------------------------------------------------
 # OpenStreetMap stack: Overpass API for the hospital search itself, Nominatim
