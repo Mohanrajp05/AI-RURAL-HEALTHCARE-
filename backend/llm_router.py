@@ -23,9 +23,23 @@ import re
 
 print("[llm_router-import] importing requests", flush=True)
 import requests
-print("[llm_router-import] importing portkey_ai SDK", flush=True)
-from portkey_ai import Portkey
-print("[llm_router-import] portkey_ai imported", flush=True)
+print("[llm_router-import] requests imported", flush=True)
+
+# `from portkey_ai import Portkey` used to sit here, at module top. On
+# Render this import was observed taking a very long time (minutes+,
+# vs. ~2.5s locally) -- almost certainly CPU/memory contention from
+# torch/transformers already being loaded in the same process by the time
+# chatbot_pipeline -> llm_router gets imported. Since llm_router is itself
+# imported synchronously inside the load_heavy_resources() background
+# thread (see app.py), a slow portkey_ai import there delayed
+# CHAT_MODULES_READY (and therefore /chat) by however long it took,
+# with zero visibility into whether it was progressing or truly stuck.
+# The Portkey class is only ever instantiated in call_portkey() below, so
+# the import is deferred there instead -- llm_router's own import becomes
+# fast and unconditional, and the (still slow) portkey_ai import happens
+# lazily on the first real Portkey-tier call, off the startup critical
+# path, where a stall no longer blocks chat entirely (Tier 2/3 Ollama and
+# Tier 4 KB-lookup fallbacks still work without it).
 
 from doc_chunker import retrieve_relevant_chunks
 
@@ -125,6 +139,10 @@ def call_portkey(system_prompt, messages, user_message, timeout=PORTKEY_TIMEOUT_
         # local Ollama tiers instead of hanging on a doomed sweep again.
         print("[llm_router] Portkey breaker OPEN, skipping to local fallback")
         return None, None
+    # Deferred from module top -- see the comment above the imports at the
+    # top of this file. First call pays the (possibly slow) import cost;
+    # every call after that is a cached, instant re-import.
+    from portkey_ai import Portkey
     client = Portkey(api_key=PORTKEY_API_KEY)
     payload_messages = _build_messages(system_prompt, messages, user_message)
     for model in portkey_circuit.pick_targets(PORTKEY_MODELS):
