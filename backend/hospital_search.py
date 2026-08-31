@@ -41,6 +41,19 @@ _urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
+# overpass-api.de (the primary, most up-to-date public instance) actively
+# refuses connections from cloud/datacenter IP ranges (Render's included) as
+# an anti-abuse measure -- confirmed here by "[Errno 111] Connection
+# refused" on the very same host that resolves and connects fine from a
+# residential IP. These community-run mirrors run the same Overpass QL
+# interpreter against their own copy of OSM data and are tried in order
+# after the primary, so one being blocked/down doesn't take hospital search
+# down with it.
+OVERPASS_FALLBACK_URLS = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+
 # Both services' fair-use policies ask that a client identify itself and not
 # hammer the endpoint -- no API key to misuse instead, so this is the only
 # guardrail. Nominatim's policy is explicit about 1 request/second; Overpass
@@ -146,21 +159,27 @@ def find_nearby_hospitals(latitude, longitude, radius_meters=DEFAULT_RADIUS_METE
     out center;
     """
 
-    _throttle("overpass")
-    try:
-        resp = requests.post(
-            OVERPASS_URL,
-            data={"data": query},
-            headers={"User-Agent": _USER_AGENT},
-            timeout=30,  # > the query's own [timeout:25] server-side budget
-        )
-    except Exception as exc:
-        print(f"[hospital_search] Overpass request failed: {exc!r}")
-        return None, NETWORK_ERROR_MESSAGE
+    resp = None
+    for url in (OVERPASS_URL, *OVERPASS_FALLBACK_URLS):
+        _throttle("overpass")
+        try:
+            resp = requests.post(
+                url,
+                data={"data": query},
+                headers={"User-Agent": _USER_AGENT},
+                timeout=30,  # > the query's own [timeout:25] server-side budget
+            )
+        except Exception as exc:
+            print(f"[hospital_search] Overpass request to {url} failed: {exc!r}")
+            resp = None
+            continue
+        if resp.status_code == 200:
+            break
+        print(f"[hospital_search] Overpass status from {url}: {resp.status_code}")
+        resp = None
 
-    if resp.status_code != 200:
-        print(f"[hospital_search] Overpass status: {resp.status_code}")
-        return None, f"Could not find hospitals nearby (status: {resp.status_code})."
+    if resp is None:
+        return None, NETWORK_ERROR_MESSAGE
 
     try:
         data = resp.json()
