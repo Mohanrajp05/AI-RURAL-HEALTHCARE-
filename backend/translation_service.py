@@ -3,7 +3,6 @@ import re
 import threading
 import os
 import time
-import torch
 
 
 _SLASH_WORD_RE = re.compile(r"([A-Za-z])/([A-Za-z])")
@@ -15,11 +14,27 @@ def _normalize_for_translation(text: str) -> str:
 INDIC2EN_MODEL = os.environ.get("IT2_INDIC_EN_MODEL", "prajdabre/rotary-indictrans2-indic-en-dist-200M")
 EN2INDIC_MODEL = os.environ.get("IT2_EN_INDIC_MODEL", "prajdabre/rotary-indictrans2-en-indic-dist-200M")
 
-# GPU when available (huge win: these models otherwise run fp32 on CPU for
-# every non-English turn). fp16 only on CUDA -- fp16 matmul on CPU is
-# unsupported/slow, so CPU stays fp32.
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-_DTYPE = torch.float16 if _DEVICE == "cuda" else torch.float32
+# Render's free tier (512MB RAM) gets OOM-killed once torch + transformers
+# + sklearn are all resident -- well before IndicTrans2's own weights even
+# load. Ollama isn't used in production (Portkey/Gemini/GPT-OSS handles
+# chat), so SKIP_LOCAL_ML=true (set in Render's env, NOT local .env) routes
+# translate() through Portkey/Gemini via a prompt instead of loading
+# IndicTrans2/NLLB locally at all -- see _translate_via_portkey() below.
+SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
+
+if not SKIP_LOCAL_ML:
+    import torch
+
+    # GPU when available (huge win: these models otherwise run fp32 on CPU
+    # for every non-English turn). fp16 only on CUDA -- fp16 matmul on CPU
+    # is unsupported/slow, so CPU stays fp32.
+    _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    _DTYPE = torch.float16 if _DEVICE == "cuda" else torch.float32
+else:
+    # Never read when SKIP_LOCAL_ML is true -- translate()/preload() both
+    # short-circuit before any code that touches torch/_DEVICE/_DTYPE.
+    _DEVICE = "cpu"
+    _DTYPE = None
 
 _LANG_TO_ISO = {
     "eng_Latn": "en",
@@ -28,6 +43,38 @@ _LANG_TO_ISO = {
     "tam_Taml": "ta",
     "tel_Telu": "te",
 }
+
+_LANG_TO_NAME = {
+    "eng_Latn": "English",
+    "hin_Deva": "Hindi",
+    "kan_Knda": "Kannada",
+    "tam_Taml": "Tamil",
+    "tel_Telu": "Telugu",
+}
+
+
+def _translate_via_portkey(text: str, src_lang: str, tgt_lang: str) -> str:
+    """SKIP_LOCAL_ML production path: translate via the same Portkey/Gemini
+    gateway the rest of the app already uses for chat, instead of a local
+    IndicTrans2/NLLB model. No torch/transformers involved at all."""
+    import portkey_llm  # lightweight -- no torch, see portkey_llm.py
+
+    tgt_name = _LANG_TO_NAME.get(tgt_lang, tgt_lang)
+    prompt = (
+        f"Translate the following text to {tgt_name}. Return ONLY the "
+        f"translation, with no explanation, quotes, or extra text:\n\n{text}"
+    )
+    try:
+        content, _source = portkey_llm.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0,
+            num_predict=400,
+            timeout=20,
+        )
+        return (content or text).strip()
+    except Exception as exc:
+        print(f"[Translate] Portkey translation failed ({exc!r}); returning original text.")
+        return text
 
 _unicode_transliterator = None
 _tt_lock = threading.Lock()
@@ -92,6 +139,12 @@ def _get_nllb_fallback():
 
 def _load_models():
     global _it2_tokenizer, _it2_indic_en_model, _it2_en_indic_tokenizer, _it2_en_indic_model
+    if SKIP_LOCAL_ML:
+        raise RuntimeError(
+            "IndicTrans2 local translation is disabled (SKIP_LOCAL_ML=true) "
+            "-- translate() should have already routed to Portkey instead "
+            "of reaching this."
+        )
     if _it2_tokenizer is not None:
         return
 
@@ -133,6 +186,10 @@ def _load_models():
 
 def preload():
     """Load the IndicTrans2 models once at server startup (never per-request)."""
+    if SKIP_LOCAL_ML:
+        print("[Translate] SKIP_LOCAL_ML=true -- skipping IndicTrans2 preload, "
+              "translate() will route through Portkey instead", flush=True)
+        return
     try:
         _load_models()
     except Exception as exc:
@@ -287,12 +344,19 @@ def _translate_chunk(text: str, src_lang: str, tgt_lang: str) -> str:
 def translate(text: str, src_lang: str, tgt_lang: str) -> str:
     """Translate text via IndicTrans2, chunked by line/sentence (see
     _split_into_chunks). Falls back to NLLB -- per-chunk if IT2 errors on a
-    specific chunk, or for the whole text once IT2 is unusable."""
+    specific chunk, or for the whole text once IT2 is unusable.
+
+    SKIP_LOCAL_ML=true short-circuits all of the above and routes straight
+    through Portkey/Gemini instead -- no torch/transformers touched at all.
+    """
     global _it2_broken
     if not text or not text.strip():
         return text
     if src_lang == tgt_lang:
         return text
+
+    if SKIP_LOCAL_ML:
+        return _translate_via_portkey(text, src_lang, tgt_lang)
 
     if _it2_broken:
         return _get_nllb_fallback()(text, src_lang, tgt_lang)

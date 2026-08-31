@@ -34,6 +34,16 @@ try:
 except Exception:
     _VAD_AVAILABLE = False
 
+# Render's free tier (512MB RAM) gets OOM-killed once torch + transformers
+# + sklearn are all resident. faster-whisper looks torch-free (it's built
+# on ctranslate2) but empirically is NOT -- `from faster_whisper import
+# WhisperModel` pulls in the full torch + transformers stack too (confirmed
+# by inspecting sys.modules after loading it). SKIP_LOCAL_ML=true (set in
+# Render's env, NOT local .env) disables local ASR entirely -- see
+# _get_model() below, which raises a clear error before ever importing
+# faster_whisper, instead of loading it (and torch) on first request.
+SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
+
 _MODEL = None
 _MODEL_LOCK = None
 _MODEL_ERROR = None
@@ -83,6 +93,15 @@ def _contains_latin(text: str) -> bool:
 def _get_model():
     """Lazy-load the WhisperModel once and cache it (thread-safe)."""
     global _MODEL, _MODEL_LOCK, _MODEL_ERROR
+    if SKIP_LOCAL_ML:
+        if _MODEL_ERROR is None:
+            _MODEL_ERROR = (
+                "Voice input isn't available in this deployment "
+                "(SKIP_LOCAL_ML=true disables local Faster-Whisper -- it "
+                "pulls in torch/transformers -- to stay within the host's "
+                "memory limit)."
+            )
+        raise RuntimeError(_MODEL_ERROR)
     if _MODEL_LOCK is None:
         _MODEL_LOCK = threading.Lock()
     if _MODEL is not None:

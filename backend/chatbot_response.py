@@ -7,11 +7,14 @@ from functools import lru_cache
 
 print("[cr-import] a. importing ollama", flush=True)
 import ollama
-print("[cr-import] b. importing torch", flush=True)
-import torch
-print("[cr-import] c. importing transformers (AutoModelForSeq2SeqLM/AutoTokenizer)", flush=True)
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-print("[cr-import] d. transformers imported", flush=True)
+print("[cr-import] b. ollama imported", flush=True)
+# torch/transformers are NOT imported here anymore -- they're only used by
+# load_translation_model() below (dead code from app.py's perspective: it
+# only imports session-management helpers from this file, never
+# translate_text()/load_translation_model()), and importing them
+# unconditionally at module top was pure wasted memory on every process
+# that imports this file, whether or not that NLLB path is ever used. See
+# load_translation_model() for the lazy import.
 
 print("[cr-import] e. importing portkey_llm", flush=True)
 import portkey_llm
@@ -117,6 +120,8 @@ def load_translation_model():
 
     if _translation_tokenizer is not None and _translation_model is not None:
         return _translation_tokenizer, _translation_model
+
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, local_files_only=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL_NAME, local_files_only=True)

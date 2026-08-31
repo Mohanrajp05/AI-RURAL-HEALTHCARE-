@@ -3,6 +3,7 @@ Production-ready healthcare chatbot pipeline.
 Strict, deterministic, no hallucinations.
 """
 
+import os
 import re
 import json
 import time
@@ -10,13 +11,28 @@ import difflib
 from functools import lru_cache
 from typing import Optional, Dict, Any
 from pathlib import Path
+
+# Render's free tier (512MB RAM) gets OOM-killed once torch + transformers
+# + sklearn are all resident -- well before any model weights even load.
+# Ollama isn't used in production (Portkey/Gemini/GPT-OSS handles chat), so
+# SKIP_LOCAL_ML=true (set in Render's env, NOT local .env) skips every
+# torch-dependent local model path in this file: NLLB fallback translation
+# and RAG/FAISS semantic retrieval (see init_rag() below). The core chat
+# path -- guardrails -> FAQ/KB matcher (sklearn, lightweight) -> Portkey --
+# is unaffected either way.
+SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
 print("[cp-import] a. importing ollama", flush=True)
 import ollama
-print("[cp-import] b. importing torch", flush=True)
-import torch
-print("[cp-import] c. importing transformers (AutoModelForSeq2SeqLM/AutoTokenizer)", flush=True)
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-print("[cp-import] d. transformers imported", flush=True)
+print("[cp-import] b. ollama imported", flush=True)
+# torch/transformers are NOT imported here anymore -- they're only needed
+# by the NLLB fallback translator (load_translation_model() /
+# _nllb_translate_chunk() / nllb_translate() below), which itself is only
+# ever reached lazily, on demand, from translation_service.py's own
+# fallback path. Importing them unconditionally here meant every process
+# that imports chatbot_pipeline (i.e. every process that runs this app)
+# paid the full torch/transformers memory cost regardless of whether NLLB
+# translation ever actually ran -- see SKIP_LOCAL_ML in app.py, which this
+# was the last piece of.
 
 print("[cp-import] e. importing portkey_llm", flush=True)
 import portkey_llm
@@ -173,6 +189,18 @@ def init_rag() -> bool:
     """
     global _faiss_store, _faiss_embeddings, _faiss_error
 
+    if SKIP_LOCAL_ML:
+        # HuggingFaceEmbeddings pulls in sentence-transformers -> torch, the
+        # same memory cost this flag exists to avoid. Never even attempt
+        # it; retrieve_faiss_chunks() already degrades to [] (callers then
+        # fall back to keyword/difflib KB retrieval) when this returns
+        # False, so semantic RAG is simply unavailable, not broken.
+        if _faiss_error is None:
+            _faiss_error = RuntimeError("RAG disabled (SKIP_LOCAL_ML=true)")
+            print("[RAG] SKIP_LOCAL_ML=true -- semantic retrieval disabled, "
+                  "using keyword/difflib KB retrieval only", flush=True)
+        return False
+
     if _faiss_store is not None:
         return True
     if _faiss_error is not None:
@@ -288,8 +316,17 @@ def load_translation_model():
     """Load and cache the NLLB-200 translation model (once per process)."""
     global _translation_tokenizer, _translation_model
 
+    if SKIP_LOCAL_ML:
+        raise RuntimeError(
+            "NLLB local translation is disabled (SKIP_LOCAL_ML=true) -- "
+            "translation_service.translate() should have already routed "
+            "to Portkey instead of reaching this fallback."
+        )
+
     if _translation_tokenizer is not None and _translation_model is not None:
         return _translation_tokenizer, _translation_model
+
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME, local_files_only=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL_NAME, local_files_only=True)
@@ -311,7 +348,10 @@ def preload_translation():
 
 def _nllb_translate_chunk(text: str, src_lang: str, tgt_lang: str) -> str:
     """Translate one sentence/line-scale chunk via NLLB. Raises on failure."""
+    # load_translation_model() raises immediately if SKIP_LOCAL_ML is set,
+    # so `import torch` below never runs in that mode -- order matters here.
     tokenizer, model = load_translation_model()
+    import torch  # lazy -- see the SKIP_LOCAL_ML note at the top of this file
     tokenizer.src_lang = src_lang
 
     # _split_into_chunks() keeps every chunk sentence-scale, so this should

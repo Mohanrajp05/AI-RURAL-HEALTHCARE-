@@ -21,9 +21,20 @@ import threading
 import time
 from typing import Optional, Tuple
 
-import torch
+# Render's free tier (512MB RAM) gets OOM-killed once torch + transformers
+# + sklearn are all resident. Ollama isn't used in production, so
+# SKIP_LOCAL_ML=true (set in Render's env, NOT local .env) disables local
+# MMS-TTS entirely -- see synthesize() below, which raises a clear error
+# before ever touching torch/transformers, instead of loading a ~145MB-per-
+# language model on first request.
+SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
 
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if not SKIP_LOCAL_ML:
+    import torch
+
+    _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+else:
+    _DEVICE = "cpu"  # never read -- synthesize() raises before reaching it
 
 SUPPORTED_LANGUAGES = {
     "en": "English",
@@ -98,6 +109,10 @@ def _load_resources(lang: str):
 def preload():
     """Load every language's model once at server startup (never per-request),
     mirroring the Whisper/IndicTrans2 prewarm pattern."""
+    if SKIP_LOCAL_ML:
+        print("[tts] SKIP_LOCAL_ML=true -- skipping MMS-TTS preload, "
+              "voice output is disabled in this deployment", flush=True)
+        return
     for lang in SUPPORTED_LANGUAGES:
         try:
             _load_resources(lang)
@@ -156,6 +171,13 @@ def synthesize(text: str, language: Optional[str] = None, max_new_tokens: int = 
     previous (autoregressive) engine but unused here -- VITS has no
     token-generation budget.
     """
+    if SKIP_LOCAL_ML:
+        raise RuntimeError(
+            "Voice output isn't available in this deployment "
+            "(SKIP_LOCAL_ML=true disables local MMS-TTS to stay within "
+            "the host's memory limit)."
+        )
+
     text = str(text or "").strip()
     if not text:
         raise ValueError("text is required")

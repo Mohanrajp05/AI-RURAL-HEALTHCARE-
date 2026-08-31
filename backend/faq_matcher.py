@@ -22,6 +22,16 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 print("[faq_matcher-import] sklearn imported", flush=True)
 
+# Render's free tier (512MB RAM) gets OOM-killed once torch + transformers
+# + sklearn are all resident. The TF-IDF/difflib matching below (this
+# file's actual job) is pure sklearn and unaffected either way -- only the
+# OPTIONAL semantic-similarity guard (_get_semantic_model() below) pulls in
+# sentence-transformers -> torch, purely to refine/double-check a TF-IDF
+# hit. It already degrades gracefully to "TF-IDF/difflib only" on any
+# failure, so SKIP_LOCAL_ML=true (set in Render's env, NOT local .env)
+# simply skips ever attempting it.
+SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAQ_INDEX_PATH = os.path.join(BASE_DIR, "knowledge_base", "faq_index.json")
 
@@ -87,6 +97,11 @@ def _get_semantic_model():
     global _semantic_model, _semantic_model_failed
     if _semantic_model is not None or _semantic_model_failed:
         return _semantic_model
+    if SKIP_LOCAL_ML:
+        _semantic_model_failed = True
+        print("[faq_matcher] SKIP_LOCAL_ML=true -- semantic guard disabled, "
+              "FAQ matching uses TF-IDF/difflib only", flush=True)
+        return None
     try:
         from sentence_transformers import SentenceTransformer
         _semantic_model = SentenceTransformer(SEMANTIC_MODEL_NAME)

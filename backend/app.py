@@ -73,7 +73,27 @@ pipeline_process_query = None
 _new_pipeline_diag = None
 _run_pipeline_selftest = None
 CHAT_MODULES_READY = threading.Event()
-print("[startup] 2. chatbot_response/chatbot_pipeline import deferred to background thread", flush=True)
+
+# Render's free tier (512MB RAM) gets OOM-killed once torch + transformers
+# + sklearn are all resident in the process -- well before any model
+# weights even load. Ollama isn't used in production (Portkey/Gemini/
+# GPT-OSS handles all chat via llm_router/portkey_llm), so SKIP_LOCAL_ML=
+# true (set this in Render's dashboard env vars, NOT local .env, so local
+# dev keeps the full local-model path by default) skips every eager
+# torch-dependent preload below in load_heavy_resources() -- RAG/FAISS
+# semantic retrieval, IndicTrans2/NLLB translation, and MMS-TTS. Each of
+# those has its own SKIP_LOCAL_ML check in its own module too (chatbot_
+# pipeline.init_rag, translation_service.translate/preload, tts_service.
+# synthesize/preload), so they stay disabled even if something calls them
+# directly instead of through here. Translation still works when this flag
+# is set -- translation_service.translate() routes through Portkey/Gemini
+# instead. The core chat path (guardrails -> FAQ/KB matcher, sklearn-based
+# and lightweight -> Portkey) is unaffected either way; ASR (faster-
+# whisper/ctranslate2) doesn't use torch and is also unaffected.
+SKIP_LOCAL_ML = os.environ.get("SKIP_LOCAL_ML", "false").strip().lower() == "true"
+
+print("[startup] 2. chatbot_response/chatbot_pipeline import deferred to background thread"
+      f" (SKIP_LOCAL_ML={SKIP_LOCAL_ML})", flush=True)
 
 # NEW guarded disease-prediction pipeline (40-symptom MultiLabelBinarizer +
 # RF/NB/SVM ensemble). Imports are lazy-safe: appliance only loads the
@@ -127,14 +147,7 @@ UPLOAD_MAX_AGE_SECONDS = 24 * 60 * 60
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# .env has always used SMTP_EMAIL/SMTP_HOST (see Sender/SMTP provider
-# settings), but this used to read SMTP_USER/SMTP_SERVER -- names that were
-# never actually set anywhere, so SMTP_USER silently fell back to the
-# "your_email@gmail.com" placeholder below and the guard at the mail-send
-# call site (which explicitly checks for that placeholder) kept the whole
-# feedback-email feature disabled even with real, correct credentials in
-# .env. SMTP_USER/SMTP_SERVER are still checked second, in case anything
-# was relying on those names instead.
+
 SMTP_USER = os.environ.get("SMTP_EMAIL") or os.environ.get("SMTP_USER", "your_email@gmail.com")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "your_app_password")
 FEEDBACK_TO_EMAIL = os.environ.get("FEEDBACK_TO_EMAIL", "info@ruralhealthcare.com")
@@ -147,14 +160,7 @@ except ValueError:
 app = Flask(__name__)
 CORS(app)
 
-# Set once ALL heavy startup work (ML models, KB/index loading, MySQL
-# schema init, model prewarming) finishes in the background thread started
-# at the bottom of this file -- see load_heavy_resources(). The port is
-# bound and Flask starts accepting connections BEFORE this is set, so
-# Render's port scan succeeds immediately regardless of how long any of
-# that background work takes. Routes that have a genuine hard dependency
-# on it (see /predict) check this and return 503 instead of erroring on
-# an unloaded model.
+
 app_ready = threading.Event()
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
@@ -5223,7 +5229,16 @@ def asr():
 def load_heavy_resources():
     global chatbot_response, clear_chat_session, _set_session_disease, _get_session_disease
     global _SESSION_HISTORY, pipeline_process_query, _new_pipeline_diag, _run_pipeline_selftest
-    print("[background] Starting heavy resource loading...", flush=True)
+    print(f"[background] Starting heavy resource loading... (SKIP_LOCAL_ML={SKIP_LOCAL_ML})", flush=True)
+    if SKIP_LOCAL_ML:
+        print("[background] SKIP_LOCAL_ML=true -- RAG/FAISS, IndicTrans2/NLLB "
+              "translation, and MMS-TTS preloads below are no-ops (each has "
+              "its own SKIP_LOCAL_ML guard in its own module: chatbot_"
+              "pipeline.init_rag, translation_service.preload/translate, "
+              "tts_service.preload/synthesize). Chat still works in full "
+              "(guardrails -> FAQ/KB matcher -> Portkey), and translation "
+              "routes through Portkey/Gemini instead of a local model.",
+              flush=True)
 
     # ===== chatbot_response / chatbot_pipeline (torch/transformers, and =====
     # ===== via chatbot_pipeline -> llm_router, portkey_ai) =====
