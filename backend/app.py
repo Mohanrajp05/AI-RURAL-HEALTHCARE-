@@ -49,20 +49,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-print("[startup] 1. stdlib/flask imports done, importing chatbot_response "
-      "+ chatbot_pipeline (pulls in torch/transformers -- can be slow)...", flush=True)
-from chatbot_response import (
-    chatbot_response,
-    clear_chat_session,
-    _set_session_disease,
-    _get_session_disease,
-    _SESSION_HISTORY,
-    update_disease_context,
-)
-from chatbot_pipeline import multilingual_chatbot as pipeline_process_query
-from chatbot_pipeline import new_diag as _new_pipeline_diag
-from chatbot_pipeline import run_startup_selftest as _run_pipeline_selftest
-print("[startup] 2. chatbot_pipeline imported (torch/transformers loaded)", flush=True)
+print("[startup] 1. stdlib/flask imports done. chatbot_response + "
+      "chatbot_pipeline (pull in torch/transformers, and chatbot_pipeline "
+      "further pulls in llm_router -> portkey_ai -- all genuinely slow, "
+      "network/disk-bound imports) are deliberately NOT imported here. "
+      "Importing them at module level blocked app.py's own execution "
+      "before it ever reached the port-binding code at the bottom of this "
+      "file, which made the earlier background-thread fix ineffective -- "
+      "the heavy modules were still loaded synchronously before the "
+      "thread could even start. The real import now happens inside "
+      "load_heavy_resources(), in a background thread started AFTER the "
+      "port is bound (see __main__ below). The names below are "
+      "placeholders rebound to the real functions/dict there; every call "
+      "site waits on CHAT_MODULES_READY first, so a request that arrives "
+      "before that import finishes blocks briefly instead of hitting a "
+      "bare NameError/TypeError.", flush=True)
+chatbot_response = None
+clear_chat_session = None
+_set_session_disease = None
+_get_session_disease = None
+_SESSION_HISTORY: dict = {}
+pipeline_process_query = None
+_new_pipeline_diag = None
+_run_pipeline_selftest = None
+CHAT_MODULES_READY = threading.Event()
+print("[startup] 2. chatbot_response/chatbot_pipeline import deferred to background thread", flush=True)
 
 # NEW guarded disease-prediction pipeline (40-symptom MultiLabelBinarizer +
 # RF/NB/SVM ensemble). Imports are lazy-safe: appliance only loads the
@@ -188,8 +199,14 @@ def schedule_cleanup():
     Timer(900, schedule_cleanup).daemon = True
     Timer(900, schedule_cleanup).start()
 
-# Start cleanup scheduler at startup
-schedule_cleanup()
+# NOTE: the cleanup scheduler is started from load_heavy_resources()
+# (background thread, after chatbot_response is imported), NOT here.
+# cleanup_old_sessions() below does `from chatbot_response import
+# _SESSION_LAST_DISEASE` -- calling schedule_cleanup() at module scope
+# would trigger that (heavy, torch/transformers-pulling) import
+# synchronously during app.py's own execution, before the port is ever
+# bound -- exactly the hang this file's deferred-import setup exists to
+# avoid.
 
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "500"))
 
@@ -309,11 +326,17 @@ MAX_HISTORY = 20  # Keep last 10 user+assistant message pairs (20 messages)
 
 def get_limited_history(session_id: str) -> list:
     """Get only the last MAX_HISTORY exchanges from session history."""
+    # _SESSION_HISTORY is rebound (from the placeholder {}) to the real,
+    # shared dict inside load_heavy_resources() -- wait for that so a
+    # request landing right at startup reads the real session state
+    # instead of a transient empty placeholder.
+    CHAT_MODULES_READY.wait()
     history = _SESSION_HISTORY.get(session_id, [])
     return history[-MAX_HISTORY:]
 
 def update_history(session_id: str, user_msg: str, bot_msg: str) -> None:
     """Add user and bot messages to history and keep only last MAX_HISTORY exchanges."""
+    CHAT_MODULES_READY.wait()
     if session_id not in _SESSION_HISTORY:
         _SESSION_HISTORY[session_id] = []
     _SESSION_HISTORY[session_id].append({"role": "user", "content": user_msg})
@@ -2188,6 +2211,7 @@ def _call_simple_llm(session_id: str | None, user_query: str, filtered_context: 
 
     # Get limited conversation history (only last MAX_HISTORY exchanges) to prevent Mistral confusion
     session_key = str(session_id) if session_id else "default"
+    CHAT_MODULES_READY.wait()
     recent_history = get_limited_history(session_key)
     current_disease = _get_session_disease(session_key)
     
@@ -2521,6 +2545,7 @@ def _infer_recent_disease_from_session(session_id: str) -> str | None:
 
     # First, check session-level cached disease with TTL (if present)
     try:
+        CHAT_MODULES_READY.wait()
         remembered = _get_session_disease(session_id)
         if remembered:
             print(f"[session] Using remembered disease '{remembered}' for session {session_id}")
@@ -3460,6 +3485,7 @@ def clear_session():
     session_id = str(data.get("session_id", "default")).strip() or "default"
     sessions.pop(session_id, None)
     session_token_usage.pop(session_id, None)
+    CHAT_MODULES_READY.wait()
     clear_chat_session(session_id)
     _evict_file_chunks(session_id)
     return jsonify({"cleared": True}), 200
@@ -3523,6 +3549,7 @@ def get_conversation_messages(conversation_id):
                 for m in messages
                 if m.get("message_text")
             ]
+            CHAT_MODULES_READY.wait()
             _SESSION_HISTORY[conversation_id] = history[-MAX_HISTORY:]
             last = next(
                 (m for m in reversed(messages) if m.get("sender") == "assistant"),
@@ -3563,6 +3590,7 @@ def delete_conversation(conversation_id):
                 "error": "Conversation not found or you do not have permission to delete it.",
             }), 404
         try:
+            CHAT_MODULES_READY.wait()
             _SESSION_HISTORY.pop(conversation_id, None)
             _SESSION_LAST_RESPONSE.pop(conversation_id, None)
         except Exception:
@@ -3664,6 +3692,7 @@ def predict_disease():
         qa_summary = get_disease_info_from_kb(str(final_prediction), "full summary")
 
         try:
+            CHAT_MODULES_READY.wait()
             _set_session_disease(session_id, str(final_prediction))
         except Exception as exc:
             print(f"[predict-disease] failed to set session disease: {exc}")
@@ -4177,6 +4206,13 @@ def ai_chat():
     Request:  { "message": "user question", "session_id": "optional" }
     Response: { "reply": "answer", "status": "ok" }
     """
+    # chatbot_response/chatbot_pipeline (and everything this route pulls
+    # from them: _get_session_disease, _new_pipeline_diag,
+    # pipeline_process_query, _SESSION_HISTORY) import lazily in the
+    # background -- see load_heavy_resources(). This blocks only a request
+    # that lands in the brief window before that import finishes, instead
+    # of failing on an unbound placeholder.
+    CHAT_MODULES_READY.wait()
     try:
         data = request.get_json(silent=True) or {}
         message = str(data.get("message", "")).strip()
@@ -5160,7 +5196,49 @@ def asr():
 # is consolidated here and started in a background thread; the main thread
 # binds the port immediately afterward regardless of how long this takes.
 def load_heavy_resources():
+    global chatbot_response, clear_chat_session, _set_session_disease, _get_session_disease
+    global _SESSION_HISTORY, pipeline_process_query, _new_pipeline_diag, _run_pipeline_selftest
     print("[background] Starting heavy resource loading...", flush=True)
+
+    # ===== chatbot_response / chatbot_pipeline (torch/transformers, and =====
+    # ===== via chatbot_pipeline -> llm_router, portkey_ai) =====
+    # THE actual import, deferred here from app.py's module top so it never
+    # blocks the port-binding code in __main__. Done first, before anything
+    # else in this function, so /ai-chat (which does NOT gate on the full
+    # app_ready flag below -- it lazy-loads RAG/translation/etc. itself) is
+    # unblocked as early as possible; CHAT_MODULES_READY is the narrower
+    # signal every route waits on for just these two modules.
+    print("[background] Importing chatbot_response (torch/transformers)...", flush=True)
+    from chatbot_response import (
+        chatbot_response as _cr_chatbot_response,
+        clear_chat_session as _cr_clear_chat_session,
+        _set_session_disease as _cr_set_session_disease,
+        _get_session_disease as _cr_get_session_disease,
+        _SESSION_HISTORY as _cr_session_history,
+    )
+    chatbot_response = _cr_chatbot_response
+    clear_chat_session = _cr_clear_chat_session
+    _set_session_disease = _cr_set_session_disease
+    _get_session_disease = _cr_get_session_disease
+    _SESSION_HISTORY = _cr_session_history
+    print("[background] chatbot_response imported", flush=True)
+
+    print("[background] Importing chatbot_pipeline (torch/transformers/llm_router/portkey_ai)...", flush=True)
+    from chatbot_pipeline import multilingual_chatbot as _cp_multilingual_chatbot
+    from chatbot_pipeline import new_diag as _cp_new_diag
+    from chatbot_pipeline import run_startup_selftest as _cp_run_startup_selftest
+    pipeline_process_query = _cp_multilingual_chatbot
+    _new_pipeline_diag = _cp_new_diag
+    _run_pipeline_selftest = _cp_run_startup_selftest
+    print("[background] chatbot_pipeline imported", flush=True)
+
+    CHAT_MODULES_READY.set()
+    print("[background] CHAT_MODULES_READY set -- /ai-chat and friends unblocked", flush=True)
+
+    # Cleanup scheduler starts here, not at module scope -- it transitively
+    # imports chatbot_response too (see cleanup_old_sessions), which is now
+    # already loaded above, so this is a cheap, cached re-import.
+    schedule_cleanup()
 
     # Non-blocking checks -- Ollama/ASR status, informational only.
     try:
