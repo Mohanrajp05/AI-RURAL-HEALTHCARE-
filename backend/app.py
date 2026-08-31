@@ -3719,15 +3719,35 @@ def predict_disease():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint - fast response without Ollama check"""
+    """Health check endpoint - ALWAYS responds immediately, no exceptions.
+
+    This used to do `from chatbot_response import _SESSION_LAST_DISEASE`
+    and `from chatbot_pipeline import ollama_ready` unconditionally. Those
+    look like cheap re-imports (Python caches modules), but while
+    chatbot_pipeline is still mid-import in the load_heavy_resources()
+    background thread -- its own import chain (chatbot_pipeline ->
+    llm_router -> portkey_ai) can take a long time, especially under
+    memory pressure from torch/transformers already being loaded -- the
+    module is present in sys.modules but not yet finished initializing.
+    Python's per-module import lock then made THIS request block until
+    that background import completed, hanging /health indefinitely even
+    though the port was already open and Render had marked the service
+    live. Gate on CHAT_MODULES_READY.is_set() (a non-blocking check, unlike
+    .wait()) instead: only touch chatbot_response/chatbot_pipeline once
+    they're confirmed fully imported.
+    """
     try:
-        from chatbot_response import _SESSION_LAST_DISEASE
         process = psutil.Process(os.getpid())
         memory_mb = process.memory_info().rss / 1024 / 1024
-        active_sessions = len(_SESSION_LAST_DISEASE)
-        
-        from chatbot_pipeline import ollama_ready
-        llm_available = bool(ollama_ready())
+
+        active_sessions = 0
+        llm_available = False
+        if CHAT_MODULES_READY.is_set():
+            from chatbot_response import _SESSION_LAST_DISEASE
+            active_sessions = len(_SESSION_LAST_DISEASE)
+
+            from chatbot_pipeline import ollama_ready
+            llm_available = bool(ollama_ready())
 
         from speech_service import asr_status
         _asr = asr_status()
@@ -3740,6 +3760,11 @@ def health():
             # field is for anyone polling readiness specifically, not for
             # Render's own port scan.
             "app_ready": app_ready.is_set(),
+            # True once chatbot_response/chatbot_pipeline have finished
+            # importing -- narrower than app_ready, and what /chat and
+            # /ai-chat actually wait on. active_sessions/llm_available are
+            # only meaningful once this is true.
+            "chat_modules_ready": CHAT_MODULES_READY.is_set(),
             "memory_mb": round(memory_mb, 2),
             "active_sessions": active_sessions,
             "max_sessions": MAX_SESSIONS,
