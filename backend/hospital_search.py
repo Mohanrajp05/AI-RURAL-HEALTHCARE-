@@ -61,6 +61,18 @@ OVERPASS_FALLBACK_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
+# Geoapify's Places API, tried first (see _geoapify_nearby_hospitals below)
+# when an API key is configured. Unlike the free public Overpass instances
+# above, Geoapify is a key-gated commercial service -- it has no reason to
+# block/drop traffic from cloud-hosted callers like Render the way the
+# Overpass instances do, since a large share of its own paying customers
+# host on the same kind of infrastructure. Same underlying OSM data, so
+# result quality/coverage is equivalent; this is purely about reachability
+# from Render. No key configured -> GEOAPIFY_API_KEY is "" -> this path is
+# skipped entirely and behavior is unchanged (falls through to Overpass).
+GEOAPIFY_API_KEY = os.environ.get("GEOAPIFY_API_KEY", "").strip()
+GEOAPIFY_PLACES_URL = "https://api.geoapify.com/v2/places"
+
 # Both services' fair-use policies ask that a client identify itself and not
 # hammer the endpoint -- no API key to misuse instead, so this is the only
 # guardrail. Nominatim's policy is explicit about 1 request/second; Overpass
@@ -124,6 +136,85 @@ def _short_address(tags: dict) -> str:
     return short or "Address not available"
 
 
+def _geoapify_nearby_hospitals(lat: float, lng: float, radius_meters: int, max_results: int):
+    """Nearby-hospital search via Geoapify's Places API (categories=
+    healthcare.hospital), reached over an authenticated endpoint rather than
+    the free public Overpass instances that Render's IP range gets
+    refused/dropped by (see OVERPASS_FALLBACK_URLS above). Returns
+    (results, reason): on success `results` is a list (possibly empty) in
+    the same shape find_nearby_hospitals returns and `reason` is None; on
+    any failure `results` is None and `reason` is a short string logged by
+    the caller before it falls back to Overpass -- never a user-facing
+    message, since Overpass still gets a chance to answer.
+    """
+    try:
+        resp = requests.get(
+            GEOAPIFY_PLACES_URL,
+            params={
+                "categories": "healthcare.hospital",
+                "filter": f"circle:{lng},{lat},{radius_meters}",
+                "bias": f"proximity:{lng},{lat}",
+                "limit": 20,  # over-fetch and sort ourselves below, same reasoning as the Overpass path's uncapped query
+                "apiKey": GEOAPIFY_API_KEY,
+            },
+            timeout=15,
+        )
+    except Exception as exc:
+        return None, f"request failed: {exc!r}"
+
+    if resp.status_code != 200:
+        return None, f"status {resp.status_code}"
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return None, f"bad response body: {exc!r}"
+
+    results = []
+    for feature in data.get("features", []):
+        props = feature.get("properties", {})
+        name = props.get("name")
+        if not name:
+            continue  # unnamed places aren't useful to show on a hospital card, same as the Overpass path
+
+        place_lat = props.get("lat")
+        place_lng = props.get("lon")
+        if place_lat is None or place_lng is None:
+            continue
+        try:
+            place_lat = float(place_lat)
+            place_lng = float(place_lng)
+        except (TypeError, ValueError):
+            continue
+
+        # Geoapify reports `distance` (meters, from the `bias` point) itself
+        # when it's available; fall back to computing it the same way the
+        # Overpass path does if that field is ever missing.
+        distance = props.get("distance")
+        if distance is None:
+            distance = haversine_distance_meters(lat, lng, place_lat, place_lng)
+
+        address = (
+            props.get("formatted")
+            or props.get("address_line2")
+            or props.get("address_line1")
+            or "Address not available"
+        )
+        results.append({
+            "name": name,
+            "address": address,
+            "rating": None,       # not available from Geoapify's free tier
+            "open_now": None,     # not available from Geoapify's free tier
+            "distance_meters": int(round(distance)),
+            "lat": place_lat,
+            "lng": place_lng,
+            "maps_url": f"https://www.google.com/maps/dir/?api=1&destination={place_lat},{place_lng}",
+        })
+
+    results.sort(key=lambda r: r["distance_meters"])
+    return results[:max_results], None
+
+
 def find_nearby_hospitals(latitude, longitude, radius_meters=DEFAULT_RADIUS_METERS, max_results=5):
     """Overpass search (amenity=hospital) for hospitals around
     (latitude, longitude), within a small fixed radius (see
@@ -141,6 +232,17 @@ def find_nearby_hospitals(latitude, longitude, radius_meters=DEFAULT_RADIUS_METE
         return None, "Invalid location."
     if not (-90 <= lat <= 90 and -180 <= lng <= 180):
         return None, "Invalid location."
+
+    # Try Geoapify first when a key is configured -- see GEOAPIFY_API_KEY
+    # above for why it's preferred over Overpass on a cloud host like
+    # Render. A failure here (including "no key configured", reason ==
+    # None) is not user-facing; it just falls through to the Overpass path
+    # below exactly as if Geoapify didn't exist.
+    if GEOAPIFY_API_KEY:
+        geoapify_results, reason = _geoapify_nearby_hospitals(lat, lng, radius_meters, max_results)
+        if geoapify_results is not None:
+            return geoapify_results, None
+        print(f"[hospital_search] Geoapify nearby search failed ({reason}), falling back to Overpass")
 
     # Nodes cover point-mapped hospitals; ways/relations cover hospitals
     # mapped as a building outline -- "out center" gives those a single
