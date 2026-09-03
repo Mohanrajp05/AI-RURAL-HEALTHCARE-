@@ -93,10 +93,10 @@ const ALLOWED_ATTACHMENT_EXTENSIONS = new Set([
 const ATTACHMENT_ACCEPT = Array.from(ALLOWED_ATTACHMENT_EXTENSIONS).join(",");
 const TTS_ENABLED_STORAGE_KEY = "aiAssistant.ttsEnabled";
 
-// Voice input (mic) is transcribed by Groq's cloud Whisper API (see
-// backend /api/asr -> speech_service.py), which natively supports every
-// reply language this app offers.
-const ASR_SUPPORTED_LANGUAGES = new Set(["en", "hi", "kn", "ta", "te"]);
+// Voice input (mic) is restricted to English only -- the TTS dropdown lists
+// several reply languages, but the mic button is disabled/blocked for all of
+// them except English.
+const ASR_SUPPORTED_LANGUAGES = new Set(["en"]);
 
 // BCP-47 tags for the browser's built-in speechSynthesis (client-side TTS,
 // see speakText/speakUtterance below) -- matches the same 5 languages ASR
@@ -1162,7 +1162,7 @@ export default function AIAssistant() {
     if (!ASR_SUPPORTED_LANGUAGES.has(ttsLanguage)) {
       const name = languages[ttsLanguage] || ttsLanguage;
       setMicError(
-        `Voice input (mic) isn't available for ${name} yet. Type your question instead.`
+        `Voice input (mic) is only available in English. Switch the language back to English to use the mic, or type your question in ${name} instead.`
       );
       return;
     }
@@ -2702,7 +2702,7 @@ export default function AIAssistant() {
                     <Mic className="h-4 w-4 text-emerald-600" /> Voice &amp; language
                   </h3>
                   <ul className="list-disc space-y-1 pl-5">
-                    <li>Type your question, or use the mic button to speak it -- works in English, Hindi, Kannada, Tamil, and Telugu</li>
+                    <li>Type your question, or use the mic button to speak it -- mic input works in English only</li>
                     <li>Pick a reply language from the dropdown to get answers in that language</li>
                     <li>Tap the speaker icon on any reply to hear it read aloud using your browser's voice</li>
                   </ul>
