@@ -3863,23 +3863,51 @@ def _is_valid_doctor_email(email: str) -> bool:
 
 
 def _load_doctor_accounts() -> list:
-    """Read all self-registered doctor accounts; returns a list of
-    {"email", "password_hash", "created_at"} dicts."""
-    if not os.path.exists(DOCTOR_ACCOUNTS_FILE):
-        return []
+    """Read all self-registered doctor accounts from MySQL first (source of
+    truth -- a Render web service's disk is wiped on every deploy/restart
+    unless a paid persistent Disk is attached, so a JSON-only store was
+    silently losing every doctor who signed up between deploys), falling
+    back to the local JSON file when MySQL is unavailable or has no rows
+    yet. Returns a list of {"email", "password_hash", "created_at"} dicts."""
     try:
-        with open(DOCTOR_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+        db_accounts = mysql_store.doctor_accounts_get_all()
+        if db_accounts:
+            return db_accounts
+    except Exception as e:
+        print(f"[doctor-accounts] failed to load from MySQL: {e}")
+
+    accounts = []
+    if os.path.exists(DOCTOR_ACCOUNTS_FILE):
+        try:
+            with open(DOCTOR_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            accounts = data if isinstance(data, list) else []
+        except Exception:
+            accounts = []
+
+    # Best-effort migration from JSON to MySQL when available -- once at
+    # least one row lands there, the branch above starts returning DB data
+    # on every subsequent call instead of reaching this fallback.
+    if accounts and mysql_store.is_available():
+        try:
+            for account in accounts:
+                mysql_store.doctor_account_create(
+                    str(account.get("email", "")).strip().lower(),
+                    str(account.get("password_hash", "")),
+                )
+        except Exception as e:
+            print(f"[doctor-accounts] JSON-to-MySQL migration warning: {e}")
+
+    return accounts
 
 
 def _save_doctor_accounts(accounts: list) -> None:
-    """Persist doctor accounts atomically, with a short retry on the final
-    rename -- same OneDrive-sync-lock issue (WinError 5) documented on
-    _chat_store_save, and login credentials are exactly the kind of write
-    that shouldn't be allowed to silently drop."""
+    """Persist doctor accounts atomically to the local JSON backup, with a
+    short retry on the final rename -- same OneDrive-sync-lock issue
+    (WinError 5) documented on _chat_store_save, and login credentials are
+    exactly the kind of write that shouldn't be allowed to silently drop.
+    MySQL (doctor_account_create, called by the caller) is the actual
+    source of truth on Render; this file only survives as a local backup."""
     tmp_path = DOCTOR_ACCOUNTS_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(accounts, f, ensure_ascii=False, indent=2)
@@ -3918,12 +3946,14 @@ def doctor_register():
         if any(a.get("email") == email for a in accounts):
             return jsonify({"success": False, "error": "An account with this email already exists"}), 409
 
+        password_hash = hash_password(password)
+        mysql_store.doctor_account_create(email, password_hash)  # source of truth
         accounts.append({
             "email": email,
-            "password_hash": hash_password(password),
+            "password_hash": password_hash,
             "created_at": datetime.now().isoformat(timespec="seconds"),
         })
-        _save_doctor_accounts(accounts)
+        _save_doctor_accounts(accounts)  # local backup only, best-effort
         return jsonify({"success": True, "message": "Doctor account created"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

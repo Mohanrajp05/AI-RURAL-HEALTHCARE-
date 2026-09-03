@@ -40,12 +40,7 @@ def _get_pool():
     try:
         from mysql.connector import pooling
 
-        # A missing/unreadable CA file has been observed to make the SSL
-        # handshake stall rather than fail fast, even with
-        # connection_timeout set -- check for it ourselves first so a
-        # misconfiguration is a clear, immediate log line instead of a
-        # multi-minute hang (this is what previously delayed Flask from
-        # ever binding a port on Render, well past its port-scan timeout).
+      
         ssl_kwargs = {}
         if MYSQL_SSL_CA and os.path.isfile(MYSQL_SSL_CA):
             ssl_kwargs = {"ssl_ca": MYSQL_SSL_CA, "ssl_verify_cert": True}
@@ -161,6 +156,19 @@ _SCHEMA_STATEMENTS = [
         INDEX idx_rag_chat_log_session_id (session_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    # Self-registered doctor accounts (/doctor-register in app.py). Replaces
+    # doctor_accounts.json as the source of truth -- Render's web-service
+    # filesystem is ephemeral (wiped on every deploy/restart unless a paid
+    # persistent Disk is attached), so a JSON-only store silently lost every
+    # doctor who signed up between deploys. The JSON file is kept as a
+    # best-effort local backup only; see _load_doctor_accounts() in app.py.
+    """
+    CREATE TABLE IF NOT EXISTS doctor_accounts (
+        email VARCHAR(255) PRIMARY KEY,
+        password_hash VARCHAR(255) NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
     """
     CREATE TABLE IF NOT EXISTS feedback (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -213,7 +221,8 @@ def init_schema() -> None:
         conn.commit()
         cur.close()
         print("[mysql_store] schema ready (legacy_users, patients, "
-              "chat_conversations, chat_messages, chat_usage, rag_chat_log, feedback).")
+              "chat_conversations, chat_messages, chat_usage, rag_chat_log, "
+              "doctor_accounts, feedback).")
     except Exception as exc:
         print(f"[mysql_store] init_schema failed: {exc!r}")
     finally:
@@ -898,6 +907,67 @@ def feedback_get_all() -> list[dict]:
         return result
     except Exception as exc:
         print(f"[mysql_store] feedback_get_all failed: {exc!r}")
+        return []
+    finally:
+        conn.close()
+
+
+# ===== DOCTOR ACCOUNTS (self-registered via /doctor-register) =====
+# Source of truth for doctor_login()/doctor_register() in app.py --
+# doctor_accounts.json remains only as a best-effort local backup, since a
+# Render web service's disk doesn't survive deploys/restarts without a paid
+# persistent Disk attached.
+
+def doctor_account_create(email: str, password_hash: str) -> bool:
+    """Insert one self-registered doctor account. False on failure,
+    including a duplicate email (app.py already checks for that before
+    calling this -- the UNIQUE primary key is just the race-safe backstop)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    conn = _get_conn()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO doctor_accounts (email, password_hash) VALUES (%s, %s)",
+            (email, password_hash),
+        )
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as exc:
+        print(f"[mysql_store] doctor_account_create failed: {exc!r}")
+        return False
+    finally:
+        conn.close()
+
+
+def doctor_accounts_get_all() -> list[dict]:
+    """Every self-registered doctor account, as the {"email",
+    "password_hash", "created_at"} shape app.py's doctor_accounts.json
+    always used, so callers don't need to change their access pattern.
+    Empty list when MySQL is unavailable or no accounts exist yet."""
+    conn = _get_conn()
+    if conn is None:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT email, password_hash, created_at FROM doctor_accounts")
+        rows = cur.fetchall()
+        cur.close()
+        result = []
+        for row in rows:
+            created_at = row.get("created_at")
+            result.append({
+                "email": row["email"],
+                "password_hash": row["password_hash"],
+                "created_at": created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or ""),
+            })
+        return result
+    except Exception as exc:
+        print(f"[mysql_store] doctor_accounts_get_all failed: {exc!r}")
         return []
     finally:
         conn.close()
