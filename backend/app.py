@@ -608,9 +608,15 @@ def _chat_upsert_conversation(
             conv["title"] = title
         conv["updated_at"] = now
     conv["message_count"] = int(conv.get("message_count", 0)) + message_count
-    _chat_store_save(data)
+
+    # Aiven MySQL is the source of truth (see backend/mysql_store.py) --
+    # write there FIRST, synchronously, as part of this request. The JSON
+    # file below is only a local backup/fast-read cache; Render's
+    # filesystem is ephemeral (wiped on every deploy/restart), so a record
+    # that only ever made it into chat_store.json would be lost on the
+    # next redeploy even though this request reported success.
     try:
-        mysql_store.chat_conversation_upsert(
+        ok = mysql_store.chat_conversation_upsert(
             session_id=session_id,
             user_id=user_id,
             user_email=user_email or "",
@@ -620,8 +626,12 @@ def _chat_upsert_conversation(
             updated_at=now,
             message_count=conv["message_count"],
         )
+        if not ok:
+            print(f"[CHAT-STORE] WARNING: Aiven conversation upsert did not confirm (session_id={session_id})")
     except Exception as exc:
-        print(f"[CHAT-STORE] mysql conversation mirror failed: {exc}")
+        print(f"[CHAT-STORE] WARNING: Aiven conversation upsert failed (session_id={session_id}): {exc}")
+
+    _chat_store_save(data)
     return conv
 
 
@@ -653,13 +663,19 @@ def _chat_add_message(
         msg["file_name"] = str(file_name)[:255]
     if file_content:
         msg["file_content"] = str(file_content)
+
+    # Aiven first (source of truth), same reasoning as
+    # _chat_upsert_conversation() above -- JSON is a local backup only.
+    try:
+        ok = mysql_store.chat_message_insert(msg)
+        if not ok:
+            print(f"[CHAT-STORE] WARNING: Aiven message insert did not confirm (conversation_id={conversation_id})")
+    except Exception as exc:
+        print(f"[CHAT-STORE] WARNING: Aiven message insert failed (conversation_id={conversation_id}): {exc}")
+
     data = _chat_store_load()
     data["messages"].append(msg)
     _chat_store_save(data)
-    try:
-        mysql_store.chat_message_insert(msg)
-    except Exception as exc:
-        print(f"[CHAT-STORE] mysql message mirror failed: {exc}")
 
 
 def _chat_save_exchange(
@@ -791,19 +807,24 @@ def _chat_read_usage(user_email: str) -> dict:
 
 
 def _chat_write_usage(user_email: str, entry: dict) -> None:
-    """Persist a user's response-quota record ({count, window_start})."""
-    data = _chat_store_load()
-    data["usage"][user_email] = dict(entry)
-    _chat_store_save(data)
+    """Persist a user's response-quota record ({count, window_start}).
+    Aiven first (source of truth), JSON as local backup -- same reasoning
+    as _chat_upsert_conversation() above."""
     try:
-        mysql_store.chat_usage_set(
+        ok = mysql_store.chat_usage_set(
             user_email,
             int(entry.get("count", 0)),
             entry.get("window_start"),
             _chat_now_iso(),
         )
+        if not ok:
+            print(f"[CHAT-STORE] WARNING: Aiven usage write did not confirm (user_email={user_email})")
     except Exception as exc:
-        print(f"[CHAT-STORE] mysql usage mirror failed: {exc}")
+        print(f"[CHAT-STORE] WARNING: Aiven usage write failed (user_email={user_email}): {exc}")
+
+    data = _chat_store_load()
+    data["usage"][user_email] = dict(entry)
+    _chat_store_save(data)
 
 
 def migrate_chat_store_json_to_mysql() -> None:
@@ -858,7 +879,7 @@ def chat_history():
         return jsonify({"success": True, "count": len(logs), "logs": logs}), 200
     except Exception as exc:
         print(f"[RAG-LOG] /chat-history error: {exc}")
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/rag-stats', methods=['GET'])
@@ -871,7 +892,7 @@ def rag_stats():
         return jsonify({"success": True, **stats}), 200
     except Exception as exc:
         print(f"[RAG-LOG] /rag-stats error: {exc}")
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3528,7 +3549,8 @@ def list_conversations():
             "response_count": response_count,
         }), 200
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+        print(f"[app] Unhandled error at {request.path}: {exc}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/conversations/<conversation_id>/messages', methods=['GET'])
@@ -3579,7 +3601,8 @@ def get_conversation_messages(conversation_id):
             "response_count": response_count,
         }), 200
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+        print(f"[app] Unhandled error at {request.path}: {exc}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/conversations/<conversation_id>', methods=['DELETE'])
@@ -3605,7 +3628,8 @@ def delete_conversation(conversation_id):
             pass
         return jsonify({"success": True, "deleted": conversation_id}), 200
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+        print(f"[app] Unhandled error at {request.path}: {exc}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/conversations/<conversation_id>', methods=['PATCH'])
@@ -3638,7 +3662,8 @@ def rename_conversation(conversation_id):
             }), 404
         return jsonify({"success": True, "conversation": conv}), 200
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+        print(f"[app] Unhandled error at {request.path}: {exc}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 def get_disease_info_from_kb(disease_name: str, question_type: str = "full summary") -> str:
@@ -3722,7 +3747,8 @@ def predict_disease():
             "qa_summary": qa_summary,
         }), 200
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        print(f"[app] Unhandled error at {request.path}: {exc}")
+        return jsonify({"error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/health', methods=['GET'])
@@ -3788,7 +3814,8 @@ def health():
             "message": "Backend API Running"
         }), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"status": "error", "message": "An unexpected error occurred. Please try again later."}), 500
 
 @app.route('/debug-symptoms', methods=['GET'])
 def debug_symptoms():
@@ -3968,7 +3995,12 @@ def doctor_register():
         mysql_store.doctor_log_insert(email, "account_created", ip_address=_client_ip())
         return jsonify({"success": True, "message": "Doctor account created"}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/users', methods=['GET'])
@@ -3981,7 +4013,12 @@ def list_users_endpoint():
     try:
         return jsonify({"success": True, "users": supabase_admin.list_users()}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/feedback', methods=['GET'])
@@ -3991,7 +4028,12 @@ def list_feedback_endpoint():
     try:
         return jsonify({"success": True, "feedback": mysql_store.feedback_get_all()}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/admin-login', methods=['POST'])
@@ -4012,7 +4054,12 @@ def admin_login():
             mysql_store.admin_log_insert("login_failed", actor_email=email, ip_address=_client_ip())
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/doctor-login', methods=['POST'])
@@ -4042,7 +4089,12 @@ def doctor_login():
         mysql_store.doctor_log_insert(email_lower, "login_failed", ip_address=_client_ip())
         return jsonify({"success": False, "error": "Invalid email or password"}), 401
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/patients', methods=['GET'])
@@ -4055,7 +4107,12 @@ def get_patients():
         records = _load_patients_json()
         return jsonify({"success": True, "patients": records}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 def _log_patient_action(action: str, target_id, details: str = "") -> None:
@@ -4093,7 +4150,12 @@ def delete_patient(patient_id: int):
         _log_patient_action("delete_patient", patient_id)
         return jsonify({"success": True, "message": "Patient record deleted"}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/patients/delete/all', methods=['DELETE'])
@@ -4111,7 +4173,12 @@ def delete_all_patients():
         _log_patient_action("delete_all_patients", "*")
         return jsonify({"success": True, "message": "All patient records deleted"}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/admin-logs', methods=['GET'])
@@ -4121,7 +4188,12 @@ def list_admin_logs():
     try:
         return jsonify({"success": True, "logs": mysql_store.admin_logs_get_all()}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/doctor-logs', methods=['GET'])
@@ -4133,7 +4205,12 @@ def list_doctor_logs():
         email = request.args.get("email", "").strip()
         return jsonify({"success": True, "logs": mysql_store.doctor_logs_get_all(doctor_email=email)}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/doctor-profile', methods=['GET'])
@@ -4150,7 +4227,12 @@ def get_doctor_profile():
             return jsonify({"success": False, "error": "No profile found for this account"}), 404
         return jsonify({"success": True, "profile": profile}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 @app.route('/api/doctor-profile', methods=['POST'])
@@ -4173,7 +4255,12 @@ def update_doctor_profile():
         mysql_store.doctor_log_insert(email, "profile_updated", ip_address=_client_ip())
         return jsonify({"success": True, "message": "Profile updated"}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 
 # ===== FILE ATTACHMENTS (temporary uploads, 24h cleanup) =====
@@ -5100,6 +5187,19 @@ def send_feedback():
                     delivery_status = "sent"
 
                 stored = _store_feedback_to_mysql(name, email, subject, message, delivery=delivery, delivery_status=delivery_status, rating=rating)
+                if not stored:
+                    # The email genuinely sent, but the required Aiven write
+                    # (defaultdb.feedback) did not commit -- this must NOT be
+                    # reported as an unqualified success (previously it was,
+                    # silently masking a lost feedback row behind a sent email).
+                    print(f"[send-feedback] WARNING: email delivered via {delivery} but Aiven insert failed for {email!r}")
+                    return jsonify({
+                        "success": False,
+                        "error": "Feedback was emailed but could not be saved. Please try again later.",
+                        "delivery": delivery,
+                        "stored": False,
+                    }), 503
+
                 if delivery == "sendgrid":
                     response_message = "Feedback sent and saved successfully."
                 elif delivery == "email":
@@ -5173,7 +5273,12 @@ def register():
         }), 201
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -5228,7 +5333,12 @@ def login():
         }), 200
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        # Log the real exception server-side only -- str(e) on a MySQL
+        # connection failure can include host/port/username (never the
+        # password, but still infra detail an unauthenticated caller
+        # shouldn't see), so the response gets a generic message instead.
+        print(f"[app] Unhandled error at {request.path}: {e}")
+        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again later."}), 500
 
 @app.route('/', methods=['GET'])
 def home():
@@ -5258,7 +5368,8 @@ def predict_from_report():
             from PIL import Image
             text = pytesseract.image_to_string(Image.open(temp_path))
         except Exception as e:
-            return jsonify({'error': f'OCR failed: {str(e)}'}), 500
+            print(f"[app] OCR error: {e}")
+            return jsonify({'error': 'Could not read text from the uploaded image.'}), 500
     elif ext == '.pdf':
         try:
             import pdfplumber
@@ -5266,7 +5377,8 @@ def predict_from_report():
                 for page in pdf.pages:
                     text += page.extract_text() or ""
         except Exception as e:
-            return jsonify({'error': f'PDF parsing failed: {str(e)}'}), 500
+            print(f"[app] PDF parsing error: {e}")
+            return jsonify({'error': 'Could not read text from the uploaded PDF.'}), 500
     else:
         return jsonify({'error': 'Unsupported file type'}), 400
     
@@ -5312,7 +5424,7 @@ def tts_speak():
     except Exception as exc:
         print(f"[tts] gTTS error: {exc}")
         import traceback; traceback.print_exc()
-        return jsonify({"error": f"TTS failed: {exc}"}), 500
+        return jsonify({"error": "Text-to-speech failed. Please try again later."}), 500
 
 
 @app.route('/api/asr', methods=['POST'])
@@ -5348,7 +5460,7 @@ def asr():
     except Exception as exc:
         print(f"[ASR] ERROR '{file.filename}' ({language or 'auto'}): {exc}")
         import traceback; traceback.print_exc()
-        return jsonify({"error": f"ASR failed: {exc}"}), 500
+        return jsonify({"error": "Speech recognition failed. Please try again later."}), 500
 
 
 # ===== ALL heavy startup work lives here now, run in ONE background =====
