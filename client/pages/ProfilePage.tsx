@@ -1,7 +1,6 @@
 import { Layout } from "@/components/Layout";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import MfaSection from "@/components/mfa/MfaSection";
 import {
   Activity,
   AlertOctagon,
@@ -340,9 +339,6 @@ export default function ProfilePage() {
               <p className="text-sm text-muted-foreground mt-1">High Risk</p>
             </div>
           </div>
-
-          {/* Security Section */}
-          <MfaSection />
 
           {/* Assessments Section */}
           <div ref={assessmentRef} id="assessments">
