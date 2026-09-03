@@ -16,6 +16,7 @@ const DOCTOR_EMAIL_DOMAIN_RE = /^[A-Za-z0-9._%+-]+@ruralhealthcare\.com$/i;
 // and admins both view the same underlying patient assessment data.
 const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:5001";
 const SESSION_KEY = "doctor_auth";
+const SESSION_EMAIL_KEY = "doctor_auth_email";
 
 type PatientRecord = {
   id: number;
@@ -44,6 +45,31 @@ type PatientRecord = {
   riskCategory: string;
   riskScore: number;
   recommendation: string;
+};
+
+// Shape returned by GET /api/doctor-logs?email=... -- this doctor's own
+// login/action history (see doctor_data in backend/mysql_store.py).
+type DoctorLogEntry = {
+  id: number;
+  created_at: string;
+  doctor_email: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  details: string;
+  ip_address: string;
+};
+
+// Shape returned by GET /api/doctor-profile?email=... -- only exists for
+// self-registered accounts (doctor_accounts table), not the single
+// .env-configured DOCTOR_EMAIL account.
+type DoctorProfile = {
+  email: string;
+  fullName: string;
+  specialty: string;
+  hospital: string;
+  phone: string;
+  createdAt: string;
 };
 
 function DoctorLoginGate({ onAuth }: { onAuth: () => void }) {
@@ -83,6 +109,7 @@ function DoctorLoginGate({ onAuth }: { onAuth: () => void }) {
       const data = await resp.json();
       if (data.success) {
         sessionStorage.setItem(SESSION_KEY, "true");
+        sessionStorage.setItem(SESSION_EMAIL_KEY, email.trim().toLowerCase());
         onAuth();
       } else {
         setError(data.error || "Invalid credentials.");
@@ -262,9 +289,33 @@ export default function DoctorDashboard() {
   const [query, setQuery] = useState("");
   const [riskFilter, setRiskFilter] = useState<"" | "High Risk" | "Medium Risk" | "Low Risk">("")
   const [error, setError] = useState("");
+  const [tab, setTab] = useState<"patients" | "profile" | "activity">("patients");
+
+  const doctorEmail = sessionStorage.getItem(SESSION_EMAIL_KEY) || "";
+
+  const [profile, setProfile] = useState<DoctorProfile | null>(null);
+  const [profileForm, setProfileForm] = useState({ fullName: "", specialty: "", hospital: "", phone: "" });
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileSaved, setProfileSaved] = useState(false);
+
+  const [logs, setLogs] = useState<DoctorLogEntry[]>([]);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState("");
+
+  // Sent as X-Actor-Email/X-Actor-Role on delete calls below so
+  // doctor_data (backend/mysql_store.py) can attribute the action to this
+  // doctor instead of logging it as an anonymous "admin" action (the
+  // default role /patients falls back to for older, header-less clients).
+  const actorHeaders = (): Record<string, string> => ({
+    "X-Actor-Email": doctorEmail,
+    "X-Actor-Role": "doctor",
+  });
 
   const logout = () => {
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(SESSION_EMAIL_KEY);
     setAuthenticated(false);
   };
 
@@ -286,8 +337,82 @@ export default function DoctorDashboard() {
     }
   };
 
+  const fetchLogs = async () => {
+    setLogsLoading(true);
+    setLogsError("");
+    try {
+      const response = await fetch(`${BACKEND}/api/doctor-logs?email=${encodeURIComponent(doctorEmail)}`);
+      const data = await response.json();
+      if (data.success) {
+        setLogs(data.logs || []);
+      } else {
+        setLogsError("Failed to load activity log.");
+      }
+    } catch {
+      setLogsError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
+    } finally {
+      setLogsLoading(false);
+    }
+  };
+
+  const fetchProfile = async () => {
+    setProfileLoading(true);
+    setProfileError("");
+    try {
+      const response = await fetch(`${BACKEND}/api/doctor-profile?email=${encodeURIComponent(doctorEmail)}`);
+      const data = await response.json();
+      if (data.success) {
+        setProfile(data.profile);
+        setProfileForm({
+          fullName: data.profile.fullName || "",
+          specialty: data.profile.specialty || "",
+          hospital: data.profile.hospital || "",
+          phone: data.profile.phone || "",
+        });
+      } else {
+        // Expected for the single .env-configured DOCTOR_EMAIL account --
+        // it has no doctor_accounts row, so no profile to edit.
+        setProfile(null);
+        setProfileError(data.error || "No profile available for this account.");
+      }
+    } catch {
+      setProfileError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
+  const saveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setProfileSaving(true);
+    setProfileError("");
+    setProfileSaved(false);
+    try {
+      const response = await fetch(`${BACKEND}/api/doctor-profile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: doctorEmail, ...profileForm }),
+      });
+      const data = await response.json();
+      if (!data.success) {
+        setProfileError(data.error || "Failed to save profile.");
+        return;
+      }
+      setProfileSaved(true);
+      fetchProfile();
+      fetchLogs();
+    } catch {
+      setProfileError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
   useEffect(() => {
-    if (authenticated) fetchPatients();
+    if (!authenticated) return;
+    fetchPatients();
+    fetchProfile();
+    fetchLogs();
   }, [authenticated]);
 
   // Confirmation now happens via the in-app ConfirmDeleteModal (see JSX
@@ -297,13 +422,14 @@ export default function DoctorDashboard() {
     setDeletingId(id);
     setError("");
     try {
-      const response = await fetch(`${BACKEND}/patients/${id}`, { method: "DELETE" });
+      const response = await fetch(`${BACKEND}/patients/${id}`, { method: "DELETE", headers: actorHeaders() });
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.error || "Failed to delete patient record.");
         return;
       }
       setRecords((prev) => prev.filter((record) => record.id !== id));
+      fetchLogs();
     } catch {
       setError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
     } finally {
@@ -316,7 +442,7 @@ export default function DoctorDashboard() {
     setDeletingAll(true);
     setError("");
     try {
-      const response = await fetch(`${BACKEND}/patients/delete/all`, { method: "DELETE" });
+      const response = await fetch(`${BACKEND}/patients/delete/all`, { method: "DELETE", headers: actorHeaders() });
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.error || "Failed to delete all patient records.");
@@ -324,6 +450,7 @@ export default function DoctorDashboard() {
       }
       setRecords([]);
       setRiskFilter("");
+      fetchLogs();
     } catch {
       setError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
     } finally {
@@ -425,6 +552,196 @@ export default function DoctorDashboard() {
             </div>
           </div>
 
+          <div className="flex gap-2 mb-6">
+            <button
+              onClick={() => setTab("patients")}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                tab === "patients"
+                  ? "bg-sky-600 text-white"
+                  : "bg-white border border-border text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Patient Assessments
+            </button>
+            <button
+              onClick={() => setTab("profile")}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                tab === "profile"
+                  ? "bg-sky-600 text-white"
+                  : "bg-white border border-border text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              My Profile
+            </button>
+            <button
+              onClick={() => setTab("activity")}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                tab === "activity"
+                  ? "bg-sky-600 text-white"
+                  : "bg-white border border-border text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              My Activity
+            </button>
+          </div>
+
+          {tab === "profile" ? (
+            <div className="bg-white rounded-xl border border-border shadow-sm p-6 max-w-xl">
+              {profileLoading ? (
+                <div className="flex items-center justify-center gap-2 text-muted-foreground py-8">
+                  <Loader2 className="w-5 h-5 animate-spin" /> Loading profile...
+                </div>
+              ) : !profile ? (
+                <div className="text-muted-foreground text-sm">
+                  {profileError || "No profile available for this account."}
+                  {doctorEmail && !profileError?.includes("Unable to connect") && (
+                    <p className="mt-2 text-xs">
+                      Profile editing is only available for self-registered doctor accounts
+                      (created via "New doctor? Create an account"), not the shared login.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <form onSubmit={saveProfile} className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Email</label>
+                    <input
+                      type="email"
+                      value={profile.email}
+                      disabled
+                      className="w-full border border-border rounded-lg px-4 py-2.5 text-sm bg-gray-50 text-muted-foreground"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Full Name</label>
+                    <input
+                      type="text"
+                      value={profileForm.fullName}
+                      onChange={(e) => setProfileForm((f) => ({ ...f, fullName: e.target.value }))}
+                      placeholder="Dr. Jane Doe"
+                      className="w-full border border-border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400/40 focus:border-sky-500 transition"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Specialty</label>
+                    <input
+                      type="text"
+                      value={profileForm.specialty}
+                      onChange={(e) => setProfileForm((f) => ({ ...f, specialty: e.target.value }))}
+                      placeholder="General Medicine"
+                      className="w-full border border-border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400/40 focus:border-sky-500 transition"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Hospital / Clinic</label>
+                    <input
+                      type="text"
+                      value={profileForm.hospital}
+                      onChange={(e) => setProfileForm((f) => ({ ...f, hospital: e.target.value }))}
+                      placeholder="Rural Health Clinic"
+                      className="w-full border border-border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400/40 focus:border-sky-500 transition"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Phone</label>
+                    <input
+                      type="tel"
+                      value={profileForm.phone}
+                      onChange={(e) => setProfileForm((f) => ({ ...f, phone: e.target.value }))}
+                      placeholder="+91 90000 00000"
+                      className="w-full border border-border rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400/40 focus:border-sky-500 transition"
+                    />
+                  </div>
+                  {profileError && (
+                    <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3">
+                      {profileError}
+                    </div>
+                  )}
+                  {profileSaved && !profileError && (
+                    <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 text-emerald-700 text-sm rounded-lg px-4 py-3">
+                      <CheckCircle2 className="w-4 h-4" /> Profile saved.
+                    </div>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={profileSaving}
+                    className="flex items-center justify-center gap-2 bg-sky-600 text-white rounded-lg px-4 py-2.5 text-sm font-semibold hover:bg-sky-700 disabled:opacity-60 transition"
+                  >
+                    {profileSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                    {profileSaving ? "Saving…" : "Save Profile"}
+                  </button>
+                </form>
+              )}
+            </div>
+          ) : tab === "activity" ? (
+            <div className="bg-white rounded-xl border border-border shadow-sm overflow-hidden">
+              <div className="px-4 py-3 flex items-center justify-between border-b border-border bg-gray-50">
+                <p className="text-sm text-muted-foreground">
+                  {logsLoading ? "Loading…" : `${logs.length} recent event(s)`}
+                </p>
+                <button
+                  onClick={fetchLogs}
+                  className="px-3 py-1.5 rounded-lg bg-sky-600 text-white text-xs font-medium hover:bg-sky-700 transition-colors"
+                >
+                  Refresh
+                </button>
+              </div>
+              {logsLoading ? (
+                <div className="p-8 flex items-center justify-center gap-2 text-muted-foreground">
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Loading activity log...
+                </div>
+              ) : logsError ? (
+                <div className="p-4 text-red-700 bg-red-50">{logsError}</div>
+              ) : logs.length === 0 ? (
+                <div className="p-8 text-center text-muted-foreground">
+                  No activity recorded yet for this account. Logins and patient deletions will show up here.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-border">
+                      <tr>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">When</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Action</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Target</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Details</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">IP</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {logs.map((log) => (
+                        <tr key={log.id} className="border-b border-border align-top">
+                          <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
+                            {log.created_at ? new Date(log.created_at).toLocaleString() : "-"}
+                          </td>
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold ${
+                                log.action === "login_failed"
+                                  ? "bg-red-100 text-red-700"
+                                  : log.action.startsWith("delete")
+                                    ? "bg-amber-100 text-amber-700"
+                                    : "bg-emerald-100 text-emerald-700"
+                              }`}
+                            >
+                              {log.action}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
+                            {log.target_type ? `${log.target_type} ${log.target_id}` : "-"}
+                          </td>
+                          <td className="px-4 py-3 text-muted-foreground">{log.details || "-"}</td>
+                          <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">{log.ip_address || "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : (
+          <>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
             <div className="bg-white border border-border rounded-xl p-4 shadow-sm">
               <div className="flex items-center gap-2 text-muted-foreground text-sm mb-1"><Users className="w-4 h-4" /> Total Patients</div>
@@ -553,6 +870,8 @@ export default function DoctorDashboard() {
                 </table>
               </div>
             </div>
+          )}
+          </>
           )}
         </div>
 

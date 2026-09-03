@@ -5,6 +5,7 @@ import { Activity, AlertTriangle, ClipboardList, Loader2, Lock, LogOut, Search, 
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:5001";
 const SESSION_KEY = "admin_auth";
+const SESSION_EMAIL_KEY = "admin_auth_email";
 
 type PatientRecord = {
   id: number;
@@ -62,6 +63,20 @@ type FeedbackEntry = {
   deliveryStatus: string;
 };
 
+// Shape returned by GET /api/admin-logs -- one row per login attempt or
+// destructive patient action taken from this dashboard (see admin_data in
+// backend/mysql_store.py).
+type AdminLogEntry = {
+  id: number;
+  created_at: string;
+  actor_email: string;
+  action: string;
+  target_type: string;
+  target_id: string;
+  details: string;
+  ip_address: string;
+};
+
 function AdminLoginGate({ onAuth }: { onAuth: () => void }) {
   const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
@@ -88,6 +103,7 @@ function AdminLoginGate({ onAuth }: { onAuth: () => void }) {
       const data = await resp.json();
       if (data.success) {
         sessionStorage.setItem(SESSION_KEY, "true");
+        sessionStorage.setItem(SESSION_EMAIL_KEY, email.trim());
         onAuth();
       } else {
         setError(data.error || "Invalid credentials.");
@@ -184,16 +200,28 @@ export default function AdminDashboard() {
   const [query, setQuery] = useState("");
   const [riskFilter, setRiskFilter] = useState<"" | "High Risk" | "Medium Risk" | "Low Risk">("")
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<"patients" | "users" | "feedback">("patients");
+  const [tab, setTab] = useState<"patients" | "users" | "feedback" | "activity">("patients");
   const [users, setUsers] = useState<RegisteredUser[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
   const [usersError, setUsersError] = useState("");
   const [feedback, setFeedback] = useState<FeedbackEntry[]>([]);
   const [feedbackLoading, setFeedbackLoading] = useState(false);
   const [feedbackError, setFeedbackError] = useState("");
+  const [logs, setLogs] = useState<AdminLogEntry[]>([]);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState("");
+
+  // Sent as X-Actor-Email/X-Actor-Role on delete calls below so
+  // admin_data (backend/mysql_store.py) can attribute the action to this
+  // admin instead of logging it as an anonymous "admin" action.
+  const actorHeaders = (): Record<string, string> => ({
+    "X-Actor-Email": sessionStorage.getItem(SESSION_EMAIL_KEY) || "",
+    "X-Actor-Role": "admin",
+  });
 
   const logout = () => {
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(SESSION_EMAIL_KEY);
     setAuthenticated(false);
   };
 
@@ -251,11 +279,30 @@ export default function AdminDashboard() {
     }
   };
 
+  const fetchLogs = async () => {
+    setLogsLoading(true);
+    setLogsError("");
+    try {
+      const response = await fetch(`${BACKEND}/api/admin-logs`);
+      const data = await response.json();
+      if (data.success) {
+        setLogs(data.logs || []);
+      } else {
+        setLogsError("Failed to load activity log.");
+      }
+    } catch {
+      setLogsError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
+    } finally {
+      setLogsLoading(false);
+    }
+  };
+
   useEffect(() => {
     if (!authenticated) return;
     fetchPatients();
     fetchUsers();
     fetchFeedback();
+    fetchLogs();
   }, [authenticated]);
 
   // Confirmation now happens via the in-app ConfirmDeleteModal (see JSX
@@ -265,13 +312,14 @@ export default function AdminDashboard() {
     setDeletingId(id);
     setError("");
     try {
-      const response = await fetch(`${BACKEND}/patients/${id}`, { method: "DELETE" });
+      const response = await fetch(`${BACKEND}/patients/${id}`, { method: "DELETE", headers: actorHeaders() });
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.error || "Failed to delete patient record.");
         return;
       }
       setRecords((prev) => prev.filter((record) => record.id !== id));
+      fetchLogs();
     } catch {
       setError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
     } finally {
@@ -284,7 +332,7 @@ export default function AdminDashboard() {
     setDeletingAll(true);
     setError("");
     try {
-      const response = await fetch(`${BACKEND}/patients/delete/all`, { method: "DELETE" });
+      const response = await fetch(`${BACKEND}/patients/delete/all`, { method: "DELETE", headers: actorHeaders() });
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.error || "Failed to delete all patient records.");
@@ -292,6 +340,7 @@ export default function AdminDashboard() {
       }
       setRecords([]);
       setRiskFilter("");
+      fetchLogs();
     } catch {
       setError("Unable to connect to backend. Please ensure it is running at http://127.0.0.1:5001");
     } finally {
@@ -424,9 +473,88 @@ export default function AdminDashboard() {
             >
               Feedback
             </button>
+            <button
+              onClick={() => setTab("activity")}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                tab === "activity"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-white border border-border text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Activity Log
+            </button>
           </div>
 
-          {tab === "feedback" ? (
+          {tab === "activity" ? (
+            <div className="bg-white rounded-xl border border-border shadow-sm overflow-hidden">
+              <div className="px-4 py-3 flex items-center justify-between border-b border-border bg-gray-50">
+                <p className="text-sm text-muted-foreground">
+                  {logsLoading ? "Loading…" : `${logs.length} recent event(s)`}
+                </p>
+                <button
+                  onClick={fetchLogs}
+                  className="px-3 py-1.5 rounded-lg bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors"
+                >
+                  Refresh
+                </button>
+              </div>
+              {logsLoading ? (
+                <div className="p-8 flex items-center justify-center gap-2 text-muted-foreground">
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Loading activity log...
+                </div>
+              ) : logsError ? (
+                <div className="p-4 text-red-700 bg-red-50">{logsError}</div>
+              ) : logs.length === 0 ? (
+                <div className="p-8 text-center text-muted-foreground">
+                  No admin activity recorded yet. Logins and patient deletions will show up here.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-border">
+                      <tr>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">When</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Admin</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Action</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Target</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">Details</th>
+                        <th className="px-4 py-3 text-left font-semibold text-foreground whitespace-nowrap">IP</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {logs.map((log) => (
+                        <tr key={log.id} className="border-b border-border align-top">
+                          <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
+                            {log.created_at ? new Date(log.created_at).toLocaleString() : "-"}
+                          </td>
+                          <td className="px-4 py-3 text-foreground whitespace-nowrap">{log.actor_email || "-"}</td>
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold ${
+                                log.action === "login_failed"
+                                  ? "bg-red-100 text-red-700"
+                                  : log.action.startsWith("delete")
+                                    ? "bg-amber-100 text-amber-700"
+                                    : "bg-emerald-100 text-emerald-700"
+                              }`}
+                            >
+                              {log.action}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
+                            {log.target_type ? `${log.target_type} ${log.target_id}` : "-"}
+                          </td>
+                          <td className="px-4 py-3 text-muted-foreground">{log.details || "-"}</td>
+                          <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">{log.ip_address || "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : tab === "feedback" ? (
             <div className="bg-white rounded-xl border border-border shadow-sm overflow-hidden">
               <div className="px-4 py-3 flex items-center justify-between border-b border-border bg-gray-50">
                 <p className="text-sm text-muted-foreground">

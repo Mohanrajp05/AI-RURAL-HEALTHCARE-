@@ -3826,6 +3826,17 @@ def model_info():
 
 
 
+def _client_ip() -> str:
+    """Best-effort real client IP for activity-log rows. Render sits behind
+    Cloudflare (see the cf-ray header on every response), so request.remote_addr
+    alone would just be Cloudflare's edge IP -- X-Forwarded-For's first hop
+    is the actual visitor."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
 ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL",    "admin@ruralhealthcare.com")
 # No hardcoded password default -- both /admin-login and /doctor-login
 # below already reject an empty submitted password before comparing
@@ -3954,6 +3965,7 @@ def doctor_register():
             "created_at": datetime.now().isoformat(timespec="seconds"),
         })
         _save_doctor_accounts(accounts)  # local backup only, best-effort
+        mysql_store.doctor_log_insert(email, "account_created", ip_address=_client_ip())
         return jsonify({"success": True, "message": "Doctor account created"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -3994,8 +4006,10 @@ def admin_login():
             return jsonify({"success": False, "error": "Email and password are required"}), 400
 
         if email == ADMIN_EMAIL and password == ADMIN_PASSWORD:
+            mysql_store.admin_log_insert("login_success", actor_email=email, ip_address=_client_ip())
             return jsonify({"success": True, "message": "Admin authenticated"}), 200
         else:
+            mysql_store.admin_log_insert("login_failed", actor_email=email, ip_address=_client_ip())
             return jsonify({"success": False, "error": "Invalid email or password"}), 401
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -4015,14 +4029,17 @@ def doctor_login():
             return jsonify({"success": False, "error": "Email and password are required"}), 400
 
         if email == DOCTOR_EMAIL and password == DOCTOR_PASSWORD:
+            mysql_store.doctor_log_insert(email, "login_success", ip_address=_client_ip())
             return jsonify({"success": True, "message": "Doctor authenticated"}), 200
 
         email_lower = email.lower()
         accounts = _load_doctor_accounts()
         match = next((a for a in accounts if a.get("email") == email_lower), None)
         if match and match.get("password_hash") == hash_password(password):
+            mysql_store.doctor_log_insert(email_lower, "login_success", ip_address=_client_ip())
             return jsonify({"success": True, "message": "Doctor authenticated"}), 200
 
+        mysql_store.doctor_log_insert(email_lower, "login_failed", ip_address=_client_ip())
         return jsonify({"success": False, "error": "Invalid email or password"}), 401
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -4041,12 +4058,28 @@ def get_patients():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _log_patient_action(action: str, target_id, details: str = "") -> None:
+    """Attribute a destructive /patients action to whichever dashboard made
+    it. Frontend sends X-Actor-Email/X-Actor-Role (see AdminDashboard.tsx /
+    DoctorDashboard.tsx); role defaults to admin for older clients that
+    don't send these headers yet, since admin is this endpoint's original
+    caller."""
+    actor_email = request.headers.get("X-Actor-Email", "").strip()
+    role = request.headers.get("X-Actor-Role", "admin").strip().lower()
+    ip = _client_ip()
+    if role == "doctor":
+        mysql_store.doctor_log_insert(actor_email, action, target_type="patient", target_id=target_id, details=details, ip_address=ip)
+    else:
+        mysql_store.admin_log_insert(action, actor_email=actor_email, target_type="patient", target_id=target_id, details=details, ip_address=ip)
+
+
 @app.route('/patients/<int:patient_id>', methods=['DELETE'])
 def delete_patient(patient_id: int):
     """Delete a patient record by id for the admin dashboard."""
     try:
         if mysql_store.is_available():
             if mysql_store.delete_patient(patient_id):
+                _log_patient_action("delete_patient", patient_id)
                 return jsonify({"success": True, "message": "Patient record deleted"}), 200
             return jsonify({"success": False, "error": "Patient record not found"}), 404
 
@@ -4057,6 +4090,7 @@ def delete_patient(patient_id: int):
 
         with open(PATIENTS_FILE, 'w') as handle:
             json.dump(filtered, handle, indent=2)
+        _log_patient_action("delete_patient", patient_id)
         return jsonify({"success": True, "message": "Patient record deleted"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -4068,12 +4102,76 @@ def delete_all_patients():
     try:
         if mysql_store.is_available():
             deleted = mysql_store.delete_all_patients()
+            _log_patient_action("delete_all_patients", "*", details=f"deleted {deleted} records")
             return jsonify({"success": True, "message": f"Deleted {deleted} patient records"}), 200
 
         # Delete from JSON file
         with open(PATIENTS_FILE, 'w') as handle:
             json.dump([], handle, indent=2)
+        _log_patient_action("delete_all_patients", "*")
         return jsonify({"success": True, "message": "All patient records deleted"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/admin-logs', methods=['GET'])
+def list_admin_logs():
+    """Recent admin activity (logins + patient deletes) for the Admin
+    Dashboard's Activity Log tab."""
+    try:
+        return jsonify({"success": True, "logs": mysql_store.admin_logs_get_all()}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/doctor-logs', methods=['GET'])
+def list_doctor_logs():
+    """Recent doctor activity. Pass ?email=doctor@... to scope to one
+    doctor's own history (Doctor Dashboard's Activity tab); omit it for
+    every doctor's activity (Admin Dashboard's view)."""
+    try:
+        email = request.args.get("email", "").strip()
+        return jsonify({"success": True, "logs": mysql_store.doctor_logs_get_all(doctor_email=email)}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/doctor-profile', methods=['GET'])
+def get_doctor_profile():
+    """One doctor's profile fields, keyed by ?email=. Only self-registered
+    doctors (doctor_accounts table) have a profile row -- the single
+    .env-configured DOCTOR_EMAIL account doesn't."""
+    try:
+        email = request.args.get("email", "").strip()
+        if not email:
+            return jsonify({"success": False, "error": "email is required"}), 400
+        profile = mysql_store.doctor_profile_get(email)
+        if profile is None:
+            return jsonify({"success": False, "error": "No profile found for this account"}), 404
+        return jsonify({"success": True, "profile": profile}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/doctor-profile', methods=['POST'])
+def update_doctor_profile():
+    """Update a self-registered doctor's profile fields."""
+    try:
+        data = request.get_json(silent=True) or {}
+        email = str(data.get("email", "")).strip()
+        if not email:
+            return jsonify({"success": False, "error": "email is required"}), 400
+        updated = mysql_store.doctor_profile_update(
+            email,
+            full_name=str(data.get("fullName", "")).strip(),
+            specialty=str(data.get("specialty", "")).strip(),
+            hospital=str(data.get("hospital", "")).strip(),
+            phone=str(data.get("phone", "")).strip(),
+        )
+        if not updated:
+            return jsonify({"success": False, "error": "No profile found for this account"}), 404
+        mysql_store.doctor_log_insert(email, "profile_updated", ip_address=_client_ip())
+        return jsonify({"success": True, "message": "Profile updated"}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

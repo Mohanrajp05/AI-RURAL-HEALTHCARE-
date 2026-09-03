@@ -169,6 +169,39 @@ _SCHEMA_STATEMENTS = [
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    # Admin activity log: one row per login attempt and per destructive
+    # action (patient delete/delete-all) taken from the Admin Dashboard --
+    # answers "who did what, and when" since there's no server-side session,
+    # just a sessionStorage flag on the frontend.
+    """
+    CREATE TABLE IF NOT EXISTS admin_data (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        actor_email VARCHAR(255),
+        action VARCHAR(50),
+        target_type VARCHAR(50),
+        target_id VARCHAR(100),
+        details VARCHAR(500),
+        ip_address VARCHAR(64),
+        INDEX idx_admin_data_created_at (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    # Same as admin_data, but per doctor -- also the row-per-doctor login
+    # log referenced from doctor_logs_get().
+    """
+    CREATE TABLE IF NOT EXISTS doctor_data (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        doctor_email VARCHAR(255),
+        action VARCHAR(50),
+        target_type VARCHAR(50),
+        target_id VARCHAR(100),
+        details VARCHAR(500),
+        ip_address VARCHAR(64),
+        INDEX idx_doctor_data_doctor_email (doctor_email),
+        INDEX idx_doctor_data_created_at (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
     """
     CREATE TABLE IF NOT EXISTS feedback (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -188,6 +221,14 @@ _SCHEMA_STATEMENTS = [
 _COLUMN_MIGRATIONS = [
     ("patients", "email", "VARCHAR(255)"),
     ("feedback", "rating", "INT"),
+    # Doctor profile fields, shown/edited from the Doctor Dashboard's
+    # Profile tab -- separate from the password_hash/created_at columns
+    # doctor_accounts started with, all nullable since existing accounts
+    # predate these fields.
+    ("doctor_accounts", "full_name", "VARCHAR(255)"),
+    ("doctor_accounts", "specialty", "VARCHAR(255)"),
+    ("doctor_accounts", "hospital", "VARCHAR(255)"),
+    ("doctor_accounts", "phone", "VARCHAR(50)"),
 ]
 
 
@@ -222,7 +263,7 @@ def init_schema() -> None:
         cur.close()
         print("[mysql_store] schema ready (legacy_users, patients, "
               "chat_conversations, chat_messages, chat_usage, rag_chat_log, "
-              "doctor_accounts, feedback).")
+              "doctor_accounts, admin_data, doctor_data, feedback).")
     except Exception as exc:
         print(f"[mysql_store] init_schema failed: {exc!r}")
     finally:
@@ -968,6 +1009,181 @@ def doctor_accounts_get_all() -> list[dict]:
         return result
     except Exception as exc:
         print(f"[mysql_store] doctor_accounts_get_all failed: {exc!r}")
+        return []
+    finally:
+        conn.close()
+
+
+def doctor_profile_get(email: str) -> dict | None:
+    """One doctor's profile fields (full_name/specialty/hospital/phone), or
+    None if the email has no self-registered account. Password fields are
+    deliberately excluded -- this is for display/editing on the Doctor
+    Dashboard's Profile tab, not for auth."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    conn = _get_conn()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT email, full_name, specialty, hospital, phone, created_at "
+            "FROM doctor_accounts WHERE email = %s",
+            (email,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return None
+        created_at = row.get("created_at")
+        return {
+            "email": row["email"],
+            "fullName": row.get("full_name") or "",
+            "specialty": row.get("specialty") or "",
+            "hospital": row.get("hospital") or "",
+            "phone": row.get("phone") or "",
+            "createdAt": created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or ""),
+        }
+    except Exception as exc:
+        print(f"[mysql_store] doctor_profile_get failed: {exc!r}")
+        return None
+    finally:
+        conn.close()
+
+
+def doctor_profile_update(email: str, full_name: str = "", specialty: str = "", hospital: str = "", phone: str = "") -> bool:
+    """Update profile fields on an existing self-registered doctor account.
+    False if the email has no doctor_accounts row (profile fields piggyback
+    on that table rather than getting their own, so there's nothing to
+    update for the single .env-configured DOCTOR_EMAIL account)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    conn = _get_conn()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE doctor_accounts SET full_name = %s, specialty = %s, hospital = %s, phone = %s WHERE email = %s",
+            (full_name, specialty, hospital, phone, email),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        return updated
+    except Exception as exc:
+        print(f"[mysql_store] doctor_profile_update failed: {exc!r}")
+        return False
+    finally:
+        conn.close()
+
+
+# ===== ADMIN / DOCTOR ACTIVITY LOGS =====
+# admin_data / doctor_data: a lightweight audit trail of login attempts and
+# destructive patient actions. Neither dashboard has a server-side session
+# (just a sessionStorage flag on the frontend), so app.py passes the acting
+# email through explicitly on each call rather than this module inferring it.
+
+def admin_log_insert(action: str, actor_email: str = "", target_type: str = "",
+                      target_id: str = "", details: str = "", ip_address: str = "") -> bool:
+    conn = _get_conn()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO admin_data (actor_email, action, target_type, target_id, details, ip_address)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            """,
+            (actor_email or "", action, target_type or "", str(target_id or ""), details or "", ip_address or ""),
+        )
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as exc:
+        print(f"[mysql_store] admin_log_insert failed: {exc!r}")
+        return False
+    finally:
+        conn.close()
+
+
+def admin_logs_get_all(limit: int = 200) -> list[dict]:
+    """Most recent admin activity, newest first. Empty list when
+    unavailable (caller shows an empty Activity Log tab, not an error)."""
+    conn = _get_conn()
+    if conn is None:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id, created_at, actor_email, action, target_type, target_id, details, ip_address "
+            "FROM admin_data ORDER BY created_at DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        for row in rows:
+            created_at = row.get("created_at")
+            row["created_at"] = created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or "")
+        return rows
+    except Exception as exc:
+        print(f"[mysql_store] admin_logs_get_all failed: {exc!r}")
+        return []
+    finally:
+        conn.close()
+
+
+def doctor_log_insert(doctor_email: str, action: str, target_type: str = "",
+                       target_id: str = "", details: str = "", ip_address: str = "") -> bool:
+    conn = _get_conn()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO doctor_data (doctor_email, action, target_type, target_id, details, ip_address)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            """,
+            ((doctor_email or "").strip().lower(), action, target_type or "", str(target_id or ""), details or "", ip_address or ""),
+        )
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as exc:
+        print(f"[mysql_store] doctor_log_insert failed: {exc!r}")
+        return False
+    finally:
+        conn.close()
+
+
+def doctor_logs_get_all(limit: int = 200, doctor_email: str = "") -> list[dict]:
+    """Most recent doctor activity, newest first -- every doctor when
+    doctor_email is blank (Admin Dashboard's view), or one doctor's own
+    activity when given (Doctor Dashboard's own Activity tab)."""
+    conn = _get_conn()
+    if conn is None:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        base = ("SELECT id, created_at, doctor_email, action, target_type, target_id, details, ip_address "
+                "FROM doctor_data")
+        if doctor_email:
+            cur.execute(base + " WHERE doctor_email = %s ORDER BY created_at DESC LIMIT %s",
+                        (doctor_email.strip().lower(), limit))
+        else:
+            cur.execute(base + " ORDER BY created_at DESC LIMIT %s", (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        for row in rows:
+            created_at = row.get("created_at")
+            row["created_at"] = created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or "")
+        return rows
+    except Exception as exc:
+        print(f"[mysql_store] doctor_logs_get_all failed: {exc!r}")
         return []
     finally:
         conn.close()
