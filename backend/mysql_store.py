@@ -13,16 +13,43 @@ MYSQL_USER = os.environ.get("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "rural_healthcare")
 
-# Resolved relative to THIS file's directory, not the process's current
-# working directory -- a bare "ca.pem" only worked when the app happened
-# to be launched from inside backend/. Render's Start Command working
-# directory isn't guaranteed to match that, and when the CA file can't be
-# found at all (it was previously never even committed -- see .gitignore
-# history) mysql.connector's SSL handshake stalls rather than failing
-# fast, which was long enough to blow past Render's port-scan timeout
-# before the app ever got to bind a port.
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MYSQL_SSL_CA = os.environ.get("MYSQL_SSL_CA", os.path.join(_BASE_DIR, "ca.pem"))
+
+def _utc_iso(value) -> str:
+    """Format a stored timestamp as an explicitly UTC-marked ISO 8601
+    string for API responses.
+
+    Every timestamp column in this schema is populated either by Python's
+    datetime.now() (Render's container clock is UTC -- confirmed
+    empirically: a live request's created_at matched the real-world UTC
+    instant within request latency) or by MySQL's own CURRENT_TIMESTAMP
+    default (Aiven's server time_zone is also UTC -- confirmed via
+    `SELECT NOW(), UTC_TIMESTAMP()` returning identical values). So every
+    value read back here already IS UTC wall-clock time; it's just stored
+    and read back with no timezone marker (a naive `datetime`, or a plain
+    string for the VARCHAR-typed chat_* columns).
+
+    Appending "Z" does not change the underlying value AT ALL -- it only
+    changes how a JavaScript `Date` parser on the frontend interprets the
+    string. A bare ISO string with no offset (e.g. "2026-09-03T20:02:22")
+    is parsed as *local browser time* per the ECMAScript spec, not UTC --
+    that mismatch (a UTC wall-clock reading displayed with zero conversion
+    applied, instead of being converted to the viewer's timezone) was the
+    entire cause of timestamps appearing ~5:30 behind real IST. This never
+    touches what's stored in Aiven -- read-only, output-formatting fix.
+    """
+    if value is None or value == "":
+        return ""
+    if hasattr(value, "isoformat"):
+        return value.isoformat(timespec="seconds") + "Z"
+    s = str(value)
+    # Already timezone-marked (a "Z" suffix, or a +HH:MM/-HH:MM offset past
+    # the date/time digits) -- e.g. Supabase timestamps -- leave it alone.
+    if s.endswith("Z") or "+" in s[10:] or "-" in s[19:]:
+        return s
+    return s + "Z"
+
 
 _pool = None
 _pool_init_failed = False
@@ -39,7 +66,6 @@ def _get_pool():
         return None
     try:
         from mysql.connector import pooling
-
       
         ssl_kwargs = {}
         if MYSQL_SSL_CA and os.path.isfile(MYSQL_SSL_CA):
@@ -77,10 +103,8 @@ _SCHEMA_STATEMENTS = [
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
-    # Admin-dashboard assessment records written by /predict. `id` mirrors
-    # the sequential id the old Mongo store assigned by hand -- AUTO_INCREMENT
-    # gives the same guarantee for free.
+    """
+
     """
     CREATE TABLE IF NOT EXISTS patients (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -102,8 +126,7 @@ _SCHEMA_STATEMENTS = [
         risk_score DOUBLE,
         recommendation TEXT
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
-    # session_id doubles as the conversation id everywhere in app.py.
+    """
     """
     CREATE TABLE IF NOT EXISTS chat_conversations (
         session_id VARCHAR(100) PRIMARY KEY,
@@ -116,7 +139,7 @@ _SCHEMA_STATEMENTS = [
         message_count INT NOT NULL DEFAULT 0,
         INDEX idx_chat_conversations_user_id (user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
+    """
     """
     CREATE TABLE IF NOT EXISTS chat_messages (
         id VARCHAR(64) PRIMARY KEY,
@@ -129,7 +152,7 @@ _SCHEMA_STATEMENTS = [
         file_content LONGTEXT,
         INDEX idx_chat_messages_conversation_id (conversation_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
+    """
     """
     CREATE TABLE IF NOT EXISTS chat_usage (
         user_email VARCHAR(255) PRIMARY KEY,
@@ -137,7 +160,7 @@ _SCHEMA_STATEMENTS = [
         window_start VARCHAR(40),
         updated_at VARCHAR(40)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
+    """
   
     """
     CREATE TABLE IF NOT EXISTS rag_chat_log (
@@ -155,24 +178,16 @@ _SCHEMA_STATEMENTS = [
         model_used VARCHAR(100),
         INDEX idx_rag_chat_log_session_id (session_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
-    # Self-registered doctor accounts (/doctor-register in app.py). Replaces
-    # doctor_accounts.json as the source of truth -- Render's web-service
-    # filesystem is ephemeral (wiped on every deploy/restart unless a paid
-    # persistent Disk is attached), so a JSON-only store silently lost every
-    # doctor who signed up between deploys. The JSON file is kept as a
-    # best-effort local backup only; see _load_doctor_accounts() in app.py.
+    """
+
     """
     CREATE TABLE IF NOT EXISTS doctor_accounts (
         email VARCHAR(255) PRIMARY KEY,
         password_hash VARCHAR(255) NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    """,
-    # Admin activity log: one row per login attempt and per destructive
-    # action (patient delete/delete-all) taken from the Admin Dashboard --
-    # answers "who did what, and when" since there's no server-side session,
-    # just a sessionStorage flag on the frontend.
+    """
+ 
     """
     CREATE TABLE IF NOT EXISTS admin_data (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -186,8 +201,7 @@ _SCHEMA_STATEMENTS = [
         INDEX idx_admin_data_created_at (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
-    # Same as admin_data, but per doctor -- also the row-per-doctor login
-    # log referenced from doctor_logs_get().
+  
     """
     CREATE TABLE IF NOT EXISTS doctor_data (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -381,7 +395,7 @@ def _patient_row_to_record(row: dict) -> dict:
     created_at = row.get("created_at")
     return {
         "id": row.get("id"),
-        "createdAt": created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or ""),
+        "createdAt": _utc_iso(created_at),
         "email": row.get("email") or "",
         "patientName": row.get("patient_name") or "",
         "age": row.get("age") or "",
@@ -609,8 +623,8 @@ def chat_conversations_list(user_id: str) -> list:
                 "user_email": row["user_email"] or "",
                 "title": row["title"] or "",
                 "custom_title": bool(row["custom_title"]),
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
+                "created_at": _utc_iso(row["created_at"]),
+                "updated_at": _utc_iso(row["updated_at"]),
                 "message_count": row["message_count"],
             }
             for row in rows
@@ -663,6 +677,9 @@ def chat_messages_list(conversation_id: str) -> list:
         )
         rows = cur.fetchall()
         cur.close()
+        for row in rows:
+            if row.get("timestamp"):
+                row["timestamp"] = _utc_iso(row["timestamp"])
         return [{k: v for k, v in row.items() if v is not None} for row in rows]
     except Exception as exc:
         print(f"[mysql_store] chat_messages_list failed: {exc!r}")
@@ -822,7 +839,7 @@ def rag_log_recent(session_id: str = "", limit: int = 20) -> list | None:
                 except Exception:
                     row[key] = []
             ts = row.get("timestamp")
-            row["timestamp"] = ts.isoformat() if hasattr(ts, "isoformat") else ts
+            row["timestamp"] = _utc_iso(ts)
         return rows
     except Exception as exc:
         print(f"[mysql_store] rag_log_recent failed: {exc!r}")
@@ -936,7 +953,7 @@ def feedback_get_all() -> list[dict]:
             created_at = row.get("created_at")
             result.append({
                 "id": row.get("id"),
-                "createdAt": created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or ""),
+                "createdAt": _utc_iso(created_at),
                 "name": row.get("name") or "",
                 "email": row.get("email") or "",
                 "subject": row.get("subject") or "",
@@ -1004,7 +1021,7 @@ def doctor_accounts_get_all() -> list[dict]:
             result.append({
                 "email": row["email"],
                 "password_hash": row["password_hash"],
-                "created_at": created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or ""),
+                "created_at": _utc_iso(created_at),
             })
         return result
     except Exception as exc:
@@ -1043,7 +1060,7 @@ def doctor_profile_get(email: str) -> dict | None:
             "specialty": row.get("specialty") or "",
             "hospital": row.get("hospital") or "",
             "phone": row.get("phone") or "",
-            "createdAt": created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or ""),
+            "createdAt": _utc_iso(created_at),
         }
     except Exception as exc:
         print(f"[mysql_store] doctor_profile_get failed: {exc!r}")
@@ -1127,7 +1144,7 @@ def admin_logs_get_all(limit: int = 200) -> list[dict]:
         cur.close()
         for row in rows:
             created_at = row.get("created_at")
-            row["created_at"] = created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or "")
+            row["created_at"] = _utc_iso(created_at)
         return rows
     except Exception as exc:
         print(f"[mysql_store] admin_logs_get_all failed: {exc!r}")
@@ -1180,10 +1197,17 @@ def doctor_logs_get_all(limit: int = 200, doctor_email: str = "") -> list[dict]:
         cur.close()
         for row in rows:
             created_at = row.get("created_at")
-            row["created_at"] = created_at.isoformat(timespec="seconds") if hasattr(created_at, "isoformat") else (created_at or "")
+            row["created_at"] = _utc_iso(created_at)
         return rows
     except Exception as exc:
         print(f"[mysql_store] doctor_logs_get_all failed: {exc!r}")
         return []
     finally:
         conn.close()
+
+
+
+
+
+
+

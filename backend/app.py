@@ -277,7 +277,11 @@ def _response_limit_state(user_email: str) -> dict:
         return {"limit_reached": False, "retry_after_iso": None, "count": count}
     started = datetime.fromisoformat(entry["window_start"])
     retry_at = started + timedelta(hours=COOLDOWN_HOURS)
-    return {"limit_reached": True, "retry_after_iso": retry_at.isoformat(timespec="seconds"), "count": count}
+    # started/retry_at are naive datetimes, but genuinely UTC-valued (see
+    # mysql_store._utc_iso's docstring) -- appending "Z" only fixes how the
+    # frontend's Date parser interprets this string, it doesn't change the
+    # arithmetic above, which stays naive-to-naive throughout on purpose.
+    return {"limit_reached": True, "retry_after_iso": retry_at.isoformat(timespec="seconds") + "Z", "count": count}
 
 
 def _increment_user_response_count(user_email: str) -> int:
@@ -705,6 +709,16 @@ def _chat_save_exchange(
         print(f"[CHAT-STORE] failed to save exchange: {exc}")
 
 
+def _mark_utc(iso_str: str | None) -> str:
+    """Same reasoning as mysql_store._utc_iso() -- chat_store.json's
+    timestamps come from the same naive-but-UTC-valued _chat_now_iso(), so
+    the JSON fallback path needs the identical "Z" marker before these
+    values reach the frontend."""
+    if not iso_str:
+        return iso_str or ""
+    return iso_str if iso_str.endswith("Z") or "+" in iso_str[10:] else iso_str + "Z"
+
+
 def _chat_list_conversations(user_id: str) -> list:
     """All conversations for one user, newest first (JSON fallback path)."""
     data = _chat_store_load()
@@ -713,7 +727,10 @@ def _chat_list_conversations(user_id: str) -> list:
         if str(c.get("user_id", "")) == user_id
     ]
     rows.sort(key=lambda c: c.get("updated_at", "") or "", reverse=True)
-    return rows
+    return [
+        {**c, "created_at": _mark_utc(c.get("created_at")), "updated_at": _mark_utc(c.get("updated_at"))}
+        for c in rows
+    ]
 
 
 def _chat_get_messages(conversation_id: str) -> list:
@@ -721,7 +738,7 @@ def _chat_get_messages(conversation_id: str) -> list:
     data = _chat_store_load()
     rows = [m for m in data["messages"] if m.get("conversation_id") == conversation_id]
     rows.sort(key=lambda m: m.get("timestamp", "") or "")
-    return rows
+    return [{**m, "timestamp": _mark_utc(m.get("timestamp"))} for m in rows]
 
 
 def _chat_delete_conversation(conversation_id: str, user_id: str) -> bool:
@@ -3854,14 +3871,44 @@ def model_info():
 
 
 def _client_ip() -> str:
-    """Best-effort real client IP for activity-log rows. Render sits behind
-    Cloudflare (see the cf-ray header on every response), so request.remote_addr
-    alone would just be Cloudflare's edge IP -- X-Forwarded-For's first hop
-    is the actual visitor."""
+    """Best-effort real client IP for activity-log rows (admin_data/doctor_data).
+
+    Was returning a flat "127.0.0.1" for every request in production --
+    verified live: request.remote_addr resolves to Render's own internal
+    proxy connecting to this container over loopback, and this app was
+    never even reading Cloudflare's own client-IP header, only
+    X-Forwarded-For (which apparently isn't forwarded the way assumed
+    here, or is itself just Render's internal hop).
+
+    CF-Connecting-IP is Cloudflare's purpose-built answer to exactly this
+    problem: Cloudflare's edge sets it from its own TCP connection to the
+    visitor and OVERWRITES any value a client tried to send, so a request
+    that actually passed through Cloudflare (the custom domain, per the
+    cf-ray header seen on every response) cannot spoof it. It is
+    trustworthy for that traffic. X-Forwarded-For's first entry is the
+    fallback for anything that reaches this header (Render's own proxy
+    layer, or a request that bypassed Cloudflare via the raw *.onrender.com
+    URL) -- unlike CF-Connecting-IP, a direct request CAN forge this one,
+    but it's only ever used for informational activity-log display here,
+    never for auth/rate-limiting/security decisions, so that residual risk
+    is acceptable rather than something to defend against.
+    """
+    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip:
+        return cf_ip
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or ""
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
+    # Every header above was empty -- the platform genuinely isn't handing
+    # this process the visitor's address for this request. Say so plainly
+    # rather than silently logging a proxy-internal loopback address as if
+    # it were the real client.
+    return request.remote_addr or "unknown"
 
 
 ADMIN_EMAIL    = os.environ.get("ADMIN_EMAIL",    "admin@ruralhealthcare.com")
@@ -4105,6 +4152,12 @@ def get_patients():
             return jsonify({"success": True, "patients": mysql_store.list_patients()}), 200
 
         records = _load_patients_json()
+        # Same reasoning as mysql_store._utc_iso() -- patients.json's
+        # createdAt values come from the same naive-but-UTC-valued
+        # datetime.now() as the MySQL path, so this fallback needs the
+        # identical "Z" marker before reaching the frontend.
+        for r in records:
+            r["createdAt"] = _mark_utc(r.get("createdAt"))
         return jsonify({"success": True, "patients": records}), 200
     except Exception as e:
         # Log the real exception server-side only -- str(e) on a MySQL

@@ -2,6 +2,7 @@ import { Layout } from "@/components/Layout";
 import { ConfirmDeleteModal } from "@/components/ConfirmDeleteModal";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, ClipboardList, Loader2, Lock, LogOut, Search, ShieldCheck, Star, Trash2, Users } from "lucide-react";
+import { formatIST } from "@/lib/formatDate";
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:5001";
 const SESSION_KEY = "admin_auth";
@@ -526,7 +527,7 @@ export default function AdminDashboard() {
                       {logs.map((log) => (
                         <tr key={log.id} className="border-b border-border align-top">
                           <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                            {log.created_at ? new Date(log.created_at).toLocaleString() : "-"}
+                            {formatIST(log.created_at)}
                           </td>
                           <td className="px-4 py-3 text-foreground whitespace-nowrap">{log.actor_email || "-"}</td>
                           <td className="px-4 py-3 whitespace-nowrap">
@@ -618,7 +619,7 @@ export default function AdminDashboard() {
                             {f.message || "-"}
                           </td>
                           <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                            {f.createdAt ? new Date(f.createdAt).toLocaleString() : "-"}
+                            {formatIST(f.createdAt)}
                           </td>
                         </tr>
                       ))}
@@ -668,10 +669,10 @@ export default function AdminDashboard() {
                           <td className="px-4 py-3 text-foreground">{u.full_name || "-"}</td>
                           <td className="px-4 py-3 text-foreground capitalize">{u.provider || "email"}</td>
                           <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                            {u.created_at ? new Date(u.created_at).toLocaleString() : "-"}
+                            {formatIST(u.created_at)}
                           </td>
                           <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                            {u.last_sign_in_at ? new Date(u.last_sign_in_at).toLocaleString() : "Never"}
+                            {u.last_sign_in_at ? formatIST(u.last_sign_in_at) : "Never"}
                           </td>
                         </tr>
                       ))}
@@ -755,7 +756,7 @@ export default function AdminDashboard() {
                     {filteredRecords.map((record) => (
                       <tr key={`${record.id}-${record.createdAt}`} className="border-b border-border align-top">
                         <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                          {new Date(record.createdAt).toLocaleString()}
+                          {formatIST(record.createdAt)}
                         </td>
                         <td className="px-4 py-3 font-medium text-foreground">{record.patientName}</td>
                         <td className="px-4 py-3 text-muted-foreground">{record.email || "-"}</td>

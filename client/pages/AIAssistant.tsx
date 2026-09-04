@@ -3,6 +3,7 @@ import { Layout } from "@/components/Layout";
 import { ConfirmDeleteModal } from "@/components/ConfirmDeleteModal";
 import { useAuth } from "@/context/AuthContext";
 import { useIsMobile } from "@/hooks/use-mobile";
+import { formatIST, IST_TIME_ZONE } from "@/lib/formatDate";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -2561,7 +2562,7 @@ export default function AIAssistant() {
           <div className="print-transcript">
             <h1>Rural Healthcare AI — Chat Transcript</h1>
             <p className="print-meta">
-              Session started: {new Date(sessionStartedAt).toLocaleString()}
+              Session started: {formatIST(sessionStartedAt)}
             </p>
             {messages
               .filter((m) => m !== WELCOME && m.text !== WELCOME.text)
@@ -2569,7 +2570,7 @@ export default function AIAssistant() {
                 <div key={`${m.ts}-${i}`} className="print-msg">
                   <p className={`print-sender ${m.role === "user" ? "you" : "bot"}`}>
                     {m.role === "user" ? "You" : "Rural Healthcare AI"}
-                    <span className="print-time"> — {new Date(m.ts).toLocaleString()}</span>
+                    <span className="print-time"> — {formatIST(m.ts)}</span>
                   </p>
                   <p className="print-text">{m.text}</p>
                 </div>
@@ -2600,7 +2601,8 @@ export default function AIAssistant() {
                 You've used all {30} messages available for now. Please come back after{" "}
                 <span className="font-semibold text-slate-800">
                   {cooldownUntilIso
-                    ? new Date(cooldownUntilIso).toLocaleString(undefined, {
+                    ? new Date(cooldownUntilIso).toLocaleString("en-IN", {
+                        timeZone: IST_TIME_ZONE,
                         weekday: "short",
                         hour: "numeric",
                         minute: "2-digit",

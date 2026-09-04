@@ -2,6 +2,7 @@ import { Layout } from "@/components/Layout";
 import { ConfirmDeleteModal } from "@/components/ConfirmDeleteModal";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, CheckCircle2, ClipboardList, Loader2, Lock, LogOut, Search, Stethoscope, Trash2, Users, UserPlus } from "lucide-react";
+import { formatIST } from "@/lib/formatDate";
 
 // Doctor accounts must use this domain (matches DOCTOR_EMAIL_DOMAIN_RE in
 // app.py) -- not a real, verified mailbox, just the org's internal-account
@@ -713,7 +714,7 @@ export default function DoctorDashboard() {
                       {logs.map((log) => (
                         <tr key={log.id} className="border-b border-border align-top">
                           <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                            {log.created_at ? new Date(log.created_at).toLocaleString() : "-"}
+                            {formatIST(log.created_at)}
                           </td>
                           <td className="px-4 py-3 whitespace-nowrap">
                             <span
@@ -815,7 +816,7 @@ export default function DoctorDashboard() {
                     {filteredRecords.map((record) => (
                       <tr key={`${record.id}-${record.createdAt}`} className="border-b border-border align-top">
                         <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">
-                          {new Date(record.createdAt).toLocaleString()}
+                          {formatIST(record.createdAt)}
                         </td>
                         <td className="px-4 py-3 font-medium text-foreground">{record.patientName}</td>
                         <td className="px-4 py-3 text-muted-foreground">{record.email || "-"}</td>
