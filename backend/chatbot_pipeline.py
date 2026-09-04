@@ -41,7 +41,7 @@ import llm_router
 print("[cp-import] g. importing faq_matcher (pulls in sklearn)", flush=True)
 from faq_matcher import match_faq
 print("[cp-import] h. faq_matcher imported", flush=True)
-from web_search import search_medical_web, is_medical_query
+from web_search import search_medical_web
 
 
 
@@ -1412,19 +1412,33 @@ def process_query(
         field = detect_intent(query)
         candidate = _extract_candidate_term(query)
 
-        # CASE D: user named a specific disease/term that is not in the KB.
-        # Reserved ONLY for real named terms (e.g. "GRED"); general phrasing
-        # like "what are the early preventions" must NEVER hit this reply.
-        if candidate and _looks_like_named_term(candidate):
-            return f"'{candidate}' is not a commonly known medical term in my knowledge base. Could you rephrase or check the spelling?"
-
         # CASE B: no NEW disease named, but one is active in session memory AND
         # the message clearly asks about a field -> answer from the KB using the
         # active disease (e.g. "what are the early preventions" after Dengue).
         if remembered_disease and field and remembered_disease in kb and kb.get(remembered_disease, {}).get(field):
             disease = remembered_disease
         else:
-            # CASE C: fall through to Biomistral — a failed KB lookup never
+            # Nothing in the KB or FAQ covers this query -- covers both a real
+            # named term the KB doesn't have (e.g. "thyroid", "GRED") and
+            # general phrasing with no active disease. Policy: once KB/FAQ
+            # can't answer, go straight to Tavily web search before the LLM
+            # chain or any canned reply. No is_medical_query() gate here on
+            # purpose -- guardrails.check_guardrails() already blocks
+            # off-topic messages in app.py before process_query() is ever
+            # called (e.g. "cricket match score" never reaches here at all),
+            # so every query reaching this point is already known to be
+            # on-topic and should go to Tavily, not just ones containing one
+            # of a fixed keyword list (that list was excluding real medical
+            # terms like "vitiligo").
+            web_answer = search_medical_web(candidate or query)
+            if web_answer:
+                if diag is not None:
+                    diag["model_tier"] = "web_search"
+                return web_answer
+
+            # Tavily unconfigured/unavailable/no usable result -- fall back to
+            # the LLM chain (Ollama -> llm_router: Biomistral -> tinyllama ->
+            # Portkey/Gemini/GPT-OSS) so a failed KB+web lookup never
             # dead-ends the conversation here.
             faiss_chunks = retrieve_faiss_chunks(query, diag=diag)
             general_context = _compose_faiss_context(faiss_chunks) or _general_case_context()
@@ -1433,24 +1447,12 @@ def process_query(
                 max_words = 300 if level == "advanced" else 220
                 return limit_response_words(general_reply, max_words)
 
-            # Tier 5: web search fallback -- only reached once the full LLM
-            # chain above (call_ollama -> llm_router: Biomistral -> tinyllama
-            # -> Portkey/Gemini/GPT-OSS) has already been tried and failed.
-            # is_medical_query() is a safety-net-only gate: guardrails.
-            # check_guardrails() already blocks off-topic messages in app.py
-            # before process_query() is ever called (e.g. "cricket match
-            # score" never reaches here at all), so this can't be used to
-            # bypass guardrails -- it just stops a non-medical query that
-            # somehow got this far from triggering an external search.
-            if is_medical_query(query):
-                web_answer = search_medical_web(query)
-                if web_answer:
-                    if diag is not None:
-                        diag["model_tier"] = "web_search"
-                    return web_answer
+            # LLM (and web search) failed too. For a real named term, say so
+            # plainly rather than handing back a generic fallback reply.
+            if candidate and _looks_like_named_term(candidate):
+                return f"'{candidate}' is not a commonly known medical term in my knowledge base. Could you rephrase or check the spelling?"
 
-            # LLM (and web search) failed — fail loud and clear when Ollama
-            # itself is down.
+            # Fail loud and clear when Ollama itself is down.
             if not ollama_ready():
                 return OLLAMA_UNAVAILABLE_MESSAGE
             return limit_response_words(_fallback_general_medical_reply(query), 220)
