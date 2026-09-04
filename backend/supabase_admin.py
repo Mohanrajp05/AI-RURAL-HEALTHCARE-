@@ -21,10 +21,20 @@ from env_loader import load_env_file
 
 load_env_file()
 
-# Reuses the frontend's project URL var (VITE_SUPERBASE_URL) as the single
-# source of truth for which Supabase project this is -- no need to
-# duplicate it under a backend-only name.
-SUPABASE_URL = os.environ.get("VITE_SUPERBASE_URL", "").rstrip("/")
+# Reuses the frontend's project URL var as the single source of truth for
+# which Supabase project this is -- no need to duplicate it under a
+# backend-only name. VITE_SUPABASE_URL is the correctly-spelled name used
+# everywhere else (.env.example, client/.env.local, VITE_SUPABASE_ANON_KEY);
+# VITE_SUPERBASE_URL ("SUPER" typo) is kept as a fallback only because
+# backend/.env and this file both originally used that misspelling, and
+# whichever Render's dashboard actually has configured should still be
+# picked up without needing this code changed again.
+SUPABASE_URL = (
+    os.environ.get("VITE_SUPABASE_URL")
+    or os.environ.get("VITE_SUPERBASE_URL")
+    or os.environ.get("SUPABASE_URL")
+    or ""
+).rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 REQUEST_TIMEOUT_SECONDS = 10
