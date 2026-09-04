@@ -143,7 +143,7 @@ interface Message {
     | "hospital_fallback";
   cached?: boolean;
   fileName?: string;
-  modelTier?: "primary" | "fallback" | "portkey" | "kb_only" | "failed";
+  modelTier?: "primary" | "fallback" | "portkey" | "kb_only" | "web_search" | "failed";
   // hospital_offer: the high-risk-file quick-reply message (Trigger 2).
   riskPercent?: number;
   offerHandled?: boolean; // quick-reply clicked -- hide the button afterward
@@ -1626,7 +1626,7 @@ export default function AIAssistant() {
         guardrail_type?: string | null;
         emergency?: boolean;
         session_id?: string;
-        model_tier?: "primary" | "fallback" | "portkey" | "kb_only" | "failed";
+        model_tier?: "primary" | "fallback" | "portkey" | "kb_only" | "web_search" | "failed";
         hospital_search_requested?: boolean;
         hospital_search_urgent?: boolean;
         high_risk_offer?: { risk_percent: number; message: string };
@@ -2325,6 +2325,11 @@ export default function AIAssistant() {
                       {message.modelTier === "kb_only" && (
                         <span className="mt-1.5 block text-[10px] font-medium text-slate-400">
                           Answered from knowledge base (AI engine unavailable)
+                        </span>
+                      )}
+                      {message.modelTier === "web_search" && (
+                        <span className="mt-1.5 block text-[10px] font-medium text-slate-400">
+                          Answered via web search
                         </span>
                       )}
                     </div>

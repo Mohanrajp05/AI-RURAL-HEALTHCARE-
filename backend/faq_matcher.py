@@ -38,6 +38,25 @@ FAQ_INDEX_PATH = os.path.join(BASE_DIR, "knowledge_base", "faq_index.json")
 
 FUZZY_CUTOFF = 0.72
 
+# difflib's ratio is a character-sequence match with no notion of word
+# meaning, so a short "what is X" query shares its entire "what is "
+# prefix with every other "what is Y" FAQ question -- that alone inflates
+# the ratio to ~0.70-0.78 against a COMPLETELY unrelated Y (empirically:
+# "what is migraine" -> "what is creatinine" at 0.706; "what is stroke"
+# -> "what is cholesterol" at 0.727), both comfortably clearing the
+# general FUZZY_CUTOFF=0.72 and returning a confidently wrong answer.
+# A genuine typo of a term that IS in the FAQ scores far higher --
+# "what iz cholesterol"/"what is cholestrol" -> "what is cholesterol" at
+# 0.947/0.973 -- so short queries get a much stricter cutoff sitting in
+# the wide gap between those two bands (measured false-positive ceiling
+# 0.783, genuine-match floor 0.947), without touching TF-IDF at all
+# (TF-IDF already correctly scores both "migraine" and "stroke" at 0.000
+# -- it was never the problem; tightening ITS threshold for short queries
+# would instead have broken "what is WBC", which legitimately scores
+# 0.553, barely above TFIDF_CUTOFF).
+SHORT_QUERY_MAX_WORDS = 3
+SHORT_QUERY_FUZZY_CUTOFF = 0.85
+
 
 TFIDF_CUTOFF = 0.55
 
@@ -220,8 +239,31 @@ def match_faq(user_text: str, cutoff: float = FUZZY_CUTOFF):
     if tfidf_hit:
         return tfidf_hit
 
-    close = difflib.get_close_matches(norm, FAQ_QUESTIONS_NORMALIZED, n=1, cutoff=cutoff)
+
+    word_count = len(norm.split())
+    effective_cutoff = SHORT_QUERY_FUZZY_CUTOFF if word_count <= SHORT_QUERY_MAX_WORDS else cutoff
+
+    close = difflib.get_close_matches(norm, FAQ_QUESTIONS_NORMALIZED, n=1, cutoff=effective_cutoff)
     if close:
-        return FAQ_LOOKUP[close[0]]
+        idx = FAQ_QUESTIONS_NORMALIZED.index(close[0])
+        guard = _semantic_guard_score(user_text, idx)
+        if guard is not None and guard < SEMANTIC_GUARD_CUTOFF:
+            print(f"[faq_matcher] difflib match REJECTED by semantic guard (sem={guard:.3f}) "
+                  f"-> {FAQ_ENTRIES[idx]['question']!r} for query {user_text[:40]!r}", flush=True)
+        else:
+            ratio = difflib.SequenceMatcher(None, norm, close[0]).ratio()
+            print(f"[faq_matcher] difflib match ratio={ratio:.3f} (cutoff={effective_cutoff}, "
+                  f"words={word_count}) -> {FAQ_ENTRIES[idx]['question']!r} for query {user_text[:40]!r}", flush=True)
+            return FAQ_LOOKUP[close[0]]
+    elif word_count <= SHORT_QUERY_MAX_WORDS:
+        # Visibility for the exact case this fix targets: show what the
+        # OLD general cutoff would have matched, so a future threshold
+        # tune isn't guesswork.
+        loose = difflib.get_close_matches(norm, FAQ_QUESTIONS_NORMALIZED, n=1, cutoff=cutoff)
+        if loose:
+            ratio = difflib.SequenceMatcher(None, norm, loose[0]).ratio()
+            print(f"[faq_matcher] short-query guard blocked ratio={ratio:.3f} "
+                  f"(< strict cutoff {SHORT_QUERY_FUZZY_CUTOFF}) -> "
+                  f"{FAQ_LOOKUP[loose[0]]!r:.60}... for query {user_text[:40]!r}", flush=True)
 
     return _semantic_match(user_text)

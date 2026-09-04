@@ -41,6 +41,7 @@ import llm_router
 print("[cp-import] g. importing faq_matcher (pulls in sklearn)", flush=True)
 from faq_matcher import match_faq
 print("[cp-import] h. faq_matcher imported", flush=True)
+from web_search import search_medical_web, is_medical_query
 
 
 
@@ -1431,7 +1432,25 @@ def process_query(
             if general_reply:
                 max_words = 300 if level == "advanced" else 220
                 return limit_response_words(general_reply, max_words)
-            # LLM failed — fail loud and clear when Ollama itself is down.
+
+            # Tier 5: web search fallback -- only reached once the full LLM
+            # chain above (call_ollama -> llm_router: Biomistral -> tinyllama
+            # -> Portkey/Gemini/GPT-OSS) has already been tried and failed.
+            # is_medical_query() is a safety-net-only gate: guardrails.
+            # check_guardrails() already blocks off-topic messages in app.py
+            # before process_query() is ever called (e.g. "cricket match
+            # score" never reaches here at all), so this can't be used to
+            # bypass guardrails -- it just stops a non-medical query that
+            # somehow got this far from triggering an external search.
+            if is_medical_query(query):
+                web_answer = search_medical_web(query)
+                if web_answer:
+                    if diag is not None:
+                        diag["model_tier"] = "web_search"
+                    return web_answer
+
+            # LLM (and web search) failed — fail loud and clear when Ollama
+            # itself is down.
             if not ollama_ready():
                 return OLLAMA_UNAVAILABLE_MESSAGE
             return limit_response_words(_fallback_general_medical_reply(query), 220)
