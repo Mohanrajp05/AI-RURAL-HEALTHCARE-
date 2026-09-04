@@ -1088,6 +1088,20 @@ def doctor_profile_update(email: str, full_name: str = "", specialty: str = "", 
         )
         updated = cur.rowcount > 0
         conn.commit()
+        if not updated:
+            # mysql.connector's rowcount for UPDATE counts rows CHANGED, not
+            # rows MATCHED (no CLIENT_FOUND_ROWS flag is set on this pool --
+            # see _get_conn()). Saving a profile with no actual field change
+            # from what's already stored -- e.g. clicking Save right after
+            # the form loads, or editing a field back to its original value
+            # -- legitimately changes 0 rows even though the email matched a
+            # real doctor_accounts row. That was previously mistaken for "no
+            # account exists" and returned a false 404 ("No profile found
+            # for this account") despite the profile genuinely existing.
+            # Confirm existence directly instead of inferring it from
+            # rowcount.
+            cur.execute("SELECT 1 FROM doctor_accounts WHERE email = %s", (email,))
+            updated = cur.fetchone() is not None
         cur.close()
         return updated
     except Exception as exc:
