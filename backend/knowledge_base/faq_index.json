@@ -5,7 +5,7 @@
   },
   {
     "question": "What is the Rural Healthcare AI Assistant?",
-    "answer": "I am the Rural Healthcare AI Assistant. My primary engine is a local medical AI model (BioMistral) running on your own machine — free and private. If that ever becomes unavailable, I automatically fall back first to a lighter local model, then to cloud AI models (Gemini and DeepSeek) through a reliability gateway, and finally to my built-in medical knowledge base — so I never leave you with a broken chat. I can answer questions about 41 diseases, explain symptoms, suggest precautions, recommend diet changes, and provide emergency guidance."
+    "answer": "I am the Rural Healthcare AI Assistant. My primary engine is a local medical AI model (BioMistral) running on your own machine — free and private. If that ever becomes unavailable, I automatically fall back first to a lighter local model, then to cloud AI models (Gemini and DeepSeek) through a reliability gateway, and finally to my built-in medical knowledge base — so I never leave you with a broken chat."
   },
   {
     "question": "Who built Rural Healthcare?",
@@ -13,51 +13,51 @@
   },
   {
     "question": "Is Rural Healthcare free to use?",
-    "answer": "Yes, using Rural Healthcare is free. Disease prediction and the primary chatbot engine run locally at no cost to you. For extra reliability, the chatbot can also fall back to cloud AI providers if the local model is unavailable — this is provided to you at no charge, though it is not literally a zero-cost cloud call behind the scenes."
+    "answer": "Yes, using Rural Healthcare is free. Disease prediction and the primary chatbot engine run locally at no cost to you."
   },
   {
     "question": "Is my data safe with Rural Healthcare?",
-    "answer": "Yes. All patient data — symptoms, vitals, and predictions — is stored securely and access is role-controlled for Doctor, Patient, and Admin. Passwords must meet strong complexity requirements, and you can add two-factor authentication for extra account security."
+    "answer": "Yes. All patient data — symptoms, vitals, and predictions — is stored securely and access is role-controlled for Doctor, Patient, and Admin."
   },
   {
     "question": "Why was Rural Healthcare made?",
-    "answer": "Rural Healthcare was developed to provide basic health screening support for people in rural areas where access to doctors and healthcare facilities may be limited. The system allows users to enter their symptoms and receive an initial prediction of possible health conditions.\nThe application is not intended to replace doctors or provide a final diagnosis. It is designed as a first-level screening tool that can help identify potential health concerns and indicate when professional medical attention may be needed. In rural areas, users can seek help from the nearest available healthcare options such as primary health centers, visiting medical camps, community health workers, or telemedicine services, where a qualified healthcare professional can provide proper medical assessment and diagnosis."
+    "answer": "I built Rural Healthcare because a lot of villages and small towns don't have a doctor nearby, and people either ignore their symptoms or travel really far just to get checked for something that could've been figured out earlier. I wanted to build something that could give people a starting point — enter your symptoms, get an idea of what it might be, and know whether it's serious enough to see a doctor urgently or not."
   },
   {
     "question": "What problem does Rural Healthcare solve?",
-    "answer": "It solves three core problems: (1) limited access to medical guidance in rural areas, (2) delayed diagnosis due to doctor shortage, and (3) patients traveling long distances for basic health screening. Rural Healthcare provides fast disease-prediction and guidance with minimal dependency on internet or specialist presence."
+    "answer": "It solves three core problems: (1) limited access to medical guidance in rural areas, (2) delayed diagnosis due to doctor shortage, and (3) patients traveling long distances for basic health screening."
   },
   {
     "question": "Who is Rural Healthcare designed for?",
-    "answer": "Rural Healthcare is designed for rural patients who need quick medical guidance, health workers who assist patients without a doctor present, and rural doctors who want AI-assisted screening to see more patients efficiently."
+    "answer": "Rural Healthcare is designed for rural patients who need quick medical guidance, health workers who assist patients without a doctor present, and rural doctors who want AI-assisted screening."
   },
   {
     "question": "What is the purpose of Rural Healthcare?",
-    "answer": "The purpose is to bring accessible AI medical guidance to rural clinics — with minimal recurring cost and minimal dependency on a doctor for basic screening. It gives rural patients a first point of contact for common health concerns through AI."
+    "answer": "The purpose is to bring accessible AI medical guidance to rural clinics — with minimal recurring cost and minimal dependency on a doctor for basic screening."
   },
   {
     "question": "Does Rural Healthcare replace doctors?",
-    "answer": "No. Rural Healthcare never replaces doctors. It acts as a decision-support and screening tool — doing the groundwork of triage so the doctor spends time on critical decisions. Every prediction comes with a disclaimer recommending professional consultation."
+    "answer": "No. Rural Healthcare never replaces doctors. It acts as a decision-support and screening tool. Every prediction comes with a disclaimer recommending professional consultation."
   },
   {
     "question": "Can Rural Healthcare diagnose diseases?",
-    "answer": "No. Rural Healthcare predicts probable diseases based on symptoms using a machine learning model — this is a screening aid, not a medical diagnosis. It is a starting point for a doctor to confirm, not a final medical judgment. Always consult a qualified healthcare provider for diagnosis and treatment."
+    "answer": "No. Rural Healthcare predicts probable diseases based on symptoms using a machine learning model — this is a screening aid, not a medical diagnosis. Always consult a qualified healthcare provider for diagnosis and treatment."
   },
   {
     "question": "How is Rural Healthcare different from other health apps?",
-    "answer": "Most health apps require constant internet and paid cloud subscriptions. Rural Healthcare is not fully offline, but it is roughly 80% offline-capable: disease prediction and the primary AI chatbot (local Ollama model + knowledge base) work without internet once the models are pre-downloaded onto the device. Login, cloud AI fallback, and a few other supporting services still require internet — see 'Does Rural Healthcare work without internet?' for the full breakdown."
+    "answer": "Rural Healthcare is not fully offline, but it is roughly 80% offline-capable: disease prediction and the primary AI chatbot work without internet once the models are pre-downloaded. Login, cloud AI fallback, and a few other supporting services still require internet."
   },
   {
     "question": "What makes Rural Healthcare unique?",
-    "answer": "Four things: (1) the core prediction and chat experience is usable without internet once set up, (2) no per-consultation fee for the local tier, (3) multilingual support — English, Hindi, Kannada, Tamil, Telugu — for both text and voice, and (4) three ML models (Random Forest, Naive Bayes, SVM) working together with majority voting and a calibrated confidence system, backed by an automatic cloud AI fallback for guaranteed chat uptime."
+    "answer": "Four things: (1) the core prediction and chat experience is usable without internet once set up, (2) no per-consultation fee for the local tier, (3) multilingual support — English, Hindi, Kannada, Tamil, Telugu, and (4) three ML models working together with majority voting and a calibrated confidence system."
   },
   {
     "question": "Does Rural Healthcare work without internet?",
-    "answer": "Not fully offline, but mostly — Rural Healthcare is roughly 80% offline-capable. Symptom prediction and the chatbot's primary tier (local Ollama model plus the built-in knowledge base) work offline once the models are pre-downloaded onto the device. These parts still need internet: signing in (Google/GitHub/LinkedIn login), the cloud AI fallback tier (Gemini/DeepSeek via the reliability gateway), the cloud database (it falls back to a local file store when offline, so this is only partly affected), email notifications, and the hospital-lookup map feature. In short: prediction and chat work offline; account login, email, and cloud AI do not."
+    "answer": "Not fully offline, but mostly — roughly 80% offline-capable. Symptom prediction and the chatbot's primary tier work offline once models are pre-downloaded. Login/auth, cloud AI fallback, email, and hospital-lookup maps still need internet."
   },
   {
     "question": "What languages does Rural Healthcare support?",
-    "answer": "Rural Healthcare supports English, Hindi, Kannada, Tamil, and Telugu for both chat text and voice. Select your language from the dropdown in the chat header. Translation is powered by Meta's NLLB-200 multilingual model, loaded once at startup for fast responses; a few of the most detailed disease entries (Cancer, Breast Cancer, Parkinson's) also have hand-verified Kannada and Hindi translations for extra accuracy."
+    "answer": "Rural Healthcare supports English, Hindi, Kannada, Tamil, and Telugu for both chat text and voice."
   },
   {
     "question": "How many diseases does Rural Healthcare cover?",
@@ -65,95 +65,75 @@
   },
   {
     "question": "What are all the diseases Rural Healthcare can predict?",
-    "answer": "The 41 diseases are: (Vertigo) Positional Vertigo, AIDS, Acne, Alcoholic Hepatitis, Allergy, Arthritis, Bronchial Asthma, Cervical Spondylosis, Chicken Pox, Chronic Cholestasis, Common Cold, Dengue, Diabetes, Dimorphic Hemorrhoids (Piles), Drug Reaction, Fungal Infection, GERD, Gastroenteritis, Heart Attack, Hepatitis A, Hepatitis B, Hepatitis C, Hepatitis D, Hepatitis E, Hypertension, Hyperthyroidism, Hypoglycemia, Hypothyroidism, Impetigo, Jaundice, Malaria, Migraine, Osteoarthritis, Paralysis (Brain Hemorrhage), Peptic Ulcer Disease, Pneumonia, Psoriasis, Tuberculosis, Typhoid, Urinary Tract Infection, Varicose Veins."
-  },
-  {
-    "question": "What if my disease is not in the list of 41?",
-    "answer": "If your condition is outside the 41 diseases in the model, I will let you know and recommend you consult a doctor directly. I will not guess or provide information about diseases outside my scope. Your safety is the priority."
-  },
-  {
-    "question": "Can Rural Healthcare predict rare diseases?",
-    "answer": "Rural Healthcare is optimized for the 41 most common diseases seen in rural Indian primary healthcare settings. It is not designed for rare diseases, cancer, or complex specialist conditions. For those, please consult a specialist hospital directly."
+    "answer": "The 41 diseases are: (Vertigo) Positional Vertigo, AIDS, Acne, Alcoholic Hepatitis, Allergy, Arthritis, Bronchial Asthma, Cervical Spondylosis, Chicken Pox, Chronic Cholestasis, Common Cold, Dengue, Diabetes, Dimorphic Hemorrhoids (Piles), Drug Reaction, Fungal Infection, GERD, Gastroenteritis, Heart Attack, Hepatitis A, B, C, D, E, Hypertension, Hyperthyroidism, Hypoglycemia, Hypothyroidism, Impetigo, Jaundice, Malaria, Migraine, Osteoarthritis, Paralysis (Brain Hemorrhage), Peptic Ulcer Disease, Pneumonia, Psoriasis, Tuberculosis, Typhoid, Urinary Tract Infection, Varicose Veins."
   },
   {
     "question": "How accurate is the disease prediction?",
-    "answer": "The prediction model uses three machine learning algorithms — Random Forest, Naive Bayes, and SVM — combined through majority voting, with each prediction labelled HIGH, MEDIUM, or LOW confidence based on how strongly the models agree and how many symptoms were provided. It was trained on a large, standardized public symptom-disease dataset, and its predictions have additionally been spot-checked against WHO and CDC clinical fact sheets for a set of common diseases to confirm real-world plausibility. More symptoms generally give a more reliable result. This is a screening aid, not a diagnosis — always confirm with a doctor."
+    "answer": "The prediction model uses three machine learning algorithms — Random Forest, Naive Bayes, and SVM — combined through majority voting, with each prediction labelled HIGH, MEDIUM, or LOW confidence. More symptoms generally give a more reliable result. This is a screening aid, not a diagnosis."
   },
   {
     "question": "What do the confidence levels (High / Medium / Low) mean?",
     "answer": "HIGH confidence predictions have been correct roughly 98% of the time in testing; MEDIUM roughly 65%; LOW confidence means several diseases share very similar symptoms and the result should be treated as a shortlist rather than an answer — please see a doctor to confirm."
   },
   {
-    "question": "What does the risk level (Low / Medium / High) on my results mean?",
-    "answer": "Risk level combines the predicted disease's clinical seriousness with the model's confidence. Emergency conditions such as Heart Attack or Paralysis are always shown as High Risk regardless of confidence, so a possible emergency is never under-flagged. Less urgent chronic conditions are shown as Medium or Low Risk depending on severity and confidence."
+    "question": "What does the risk level (Low / Medium / High) mean?",
+    "answer": "Risk level combines the predicted disease's clinical seriousness with the model's confidence. Emergency conditions such as Heart Attack or Paralysis are always shown as High Risk regardless of confidence, so a possible emergency is never under-flagged."
+  },
+  {
+    "question": "What if my disease is not in the list of 41?",
+    "answer": "If your condition is outside the 41 diseases in the model, I will let you know and recommend you consult a doctor directly. I will not guess or provide information about diseases outside my scope."
   },
   {
     "question": "What is the Home page?",
-    "answer": "The Home page is the main landing page of Rural Healthcare. It introduces the system, explains what it does, and gives quick access to the Health Assessment form and AI Assistant chatbot."
+    "answer": "The Home page is the main landing page of Rural Healthcare. It introduces the system and gives quick access to the Health Assessment form and AI Assistant chatbot."
   },
   {
     "question": "What is the Health Assessment page?",
-    "answer": "The Health Assessment page is where you enter patient information — name, age, blood pressure, heart rate, temperature, blood sugar, and symptoms. After submitting, the AI predicts the most probable disease, shows a confidence score and a risk level, and provides precautions and medical guidance."
+    "answer": "The Health Assessment page is where you enter patient information — name, age, blood pressure, heart rate, temperature, blood sugar, and symptoms. After submitting, the AI predicts the most probable disease and shows confidence, risk level, and precautions."
   },
   {
     "question": "What is the AI Assistant page?",
-    "answer": "The AI Assistant is a medical chatbot covering all 41 diseases. You can type or speak your question in English, Hindi, Kannada, Tamil, or Telugu, attach documents for it to read, and have replies read aloud. Your conversations are saved permanently until you delete them."
+    "answer": "The AI Assistant is a medical chatbot covering all 41 diseases. You can type or speak your question in English, Hindi, Kannada, Tamil, or Telugu, and have replies read aloud. Your conversations are saved permanently until you delete them."
   },
   {
     "question": "What is the Admin Dashboard?",
-    "answer": "The Admin Dashboard is for doctors and administrators. It shows patient assessment records, prediction history, and related summaries. Only users with Doctor or Admin role can access it after logging in."
-  },
-  {
-    "question": "How do I start a health assessment?",
-    "answer": "Click the 'Start Assessment' button on the Home page or the 'Health Assessment' link in the navigation bar. Fill in the patient's name, age, vitals, select symptoms from the checklist or describe them in your own words, and click 'Get Assessment'."
+    "answer": "The Admin Dashboard is for doctors and administrators. It shows patient assessment records, prediction history, and related summaries. Only users with Doctor or Admin role can access it."
   },
   {
     "question": "Can I type symptoms in my own words?",
-    "answer": "Yes. Below the symptom checkboxes there is a text field where you can describe symptoms in plain English — for example 'my stomach hurts and eyes look yellow'. There's also a search bar above the checkbox grid so you can quickly find and select the right symptom from the list."
+    "answer": "Yes. Below the symptom checkboxes there is a text field where you can describe symptoms in plain English — for example 'my stomach hurts and eyes look yellow'."
   },
   {
     "question": "What vitals does the assessment form accept?",
-    "answer": "The assessment form accepts Blood Pressure (systolic and diastolic in mmHg, entered separately), Heart Rate (bpm), Temperature (°F), and Blood Sugar Level (mg/dL). Vitals are colour-coded in the results — green for normal, orange for borderline, red for critical."
+    "answer": "The assessment form accepts Blood Pressure (systolic and diastolic in mmHg, entered separately), Heart Rate (bpm), Temperature (°F), and Blood Sugar Level (mg/dL). Vitals are colour-coded in the results."
   },
   {
     "question": "What happens when I upload a health report PDF?",
-    "answer": "When you upload a PDF health report, Rural Healthcare extracts the medical text and uses it to answer your questions about your specific report content, rather than relying on general knowledge alone."
+    "answer": "When you upload a PDF health report, Rural Healthcare extracts the medical text and uses it to answer your questions about your specific report content."
+  },
+  {
+    "question": "Can I find nearby hospitals from the app?",
+    "answer": "Yes. If you ask the chatbot 'find nearest hospital' or 'hospital near me', it will request your location and show the 5 nearest hospitals with addresses, distances, and Get Directions links. If your assessment shows high risk, it will also proactively offer to find nearby hospitals."
   },
   {
     "question": "What if my risk percentage is high after assessment?",
-    "answer": "If your health assessment shows a High risk level, Rural Healthcare highlights this clearly with an urgent banner so you know to seek prompt medical attention."
-  },
-  {
-    "question": "Can I contact hospitals directly from the app?",
-    "answer": "Where hospital lookup is available in your deployment, hospital cards show contact details and directions. Availability of this feature depends on your local configuration — check with your system administrator if it is not visible."
-  },
-  {
-    "question": "What risk level triggers extra warnings?",
-    "answer": "The urgent warning is triggered automatically when the risk level is High — including whenever the predicted disease is an emergency condition like Heart Attack or Paralysis, regardless of the model's confidence score."
+    "answer": "If your assessment shows a High risk level, Rural Healthcare highlights this clearly with an urgent banner. If this involves an emergency disease like Heart Attack, it will also offer to find the nearest hospitals immediately."
   },
   {
     "question": "What AI models does the chatbot use?",
-    "answer": "The chatbot uses a multi-tier fallback chain for reliability: first a local medical AI model (BioMistral, free and private); if unavailable, a second lighter local model; if that also fails, cloud AI models (Gemini and DeepSeek) through a reliability gateway; and if even that fails, it answers directly from its built-in medical knowledge base instead of showing an error."
+    "answer": "The chatbot uses a multi-tier fallback chain: first a local medical AI model (BioMistral); if unavailable, a second lighter local model; if that fails, cloud AI models (Gemini and GPT-OSS) through a reliability gateway; and if even that fails, it answers from its built-in medical knowledge base."
   },
   {
     "question": "What kind of questions can I ask the AI Assistant?",
-    "answer": "You can ask: What causes [disease]? What are the symptoms of [disease]? How to prevent [disease]? What foods should I eat or avoid with [disease]? What are the emergency signs of [disease]? When should I see a doctor for [disease]? The assistant covers all 41 diseases in detail."
-  },
-  {
-    "question": "What questions can the AI Assistant NOT answer?",
-    "answer": "The AI Assistant only answers questions about the 41 diseases in its scope. It cannot answer questions about diseases outside this list, give drug prescriptions or dosages, provide legal or financial advice, discuss non-medical topics, or replace a doctor's clinical judgment."
-  },
-  {
-    "question": "Does the AI Assistant block unsafe or sensitive requests?",
-    "answer": "Yes. Every message passes through a safety check before reaching the AI. It automatically blocks and refuses to process attempts to share passwords or sensitive personal data, attempts to override its instructions, and clearly off-topic requests."
-  },
-  {
-    "question": "What happens if I ask an off-topic question?",
-    "answer": "I'm sorry, that topic is outside my area of expertise. I am Rural Healthcare AI, and I am here to help you only with healthcare, disease symptoms, precautions, and health-related questions. Feel free to ask me anything about your health!"
+    "answer": "You can ask: What causes [disease]? What are the symptoms? How to prevent? What foods should I eat or avoid? What are the emergency signs? When should I see a doctor? The assistant covers all 41 diseases plus common medical terms."
   },
   {
     "question": "Can the chatbot remember previous conversations?",
-    "answer": "Yes. The chatbot remembers up to the last 3 messages in your current conversation, so a close follow-up question like 'what are its symptoms' can still refer back to what you just discussed. Conversations are also saved permanently in your chat history sidebar until you delete them yourself."
+    "answer": "Yes. The chatbot remembers up to the last 3 messages in your current conversation, so a close follow-up question like 'what are its symptoms' can still refer back to what you just discussed. Conversations are also saved permanently in your chat history sidebar."
+  },
+  {
+    "question": "Does the AI Assistant block unsafe or sensitive requests?",
+    "answer": "Yes. Every message passes through a safety check before reaching the AI. It automatically blocks attempts to share passwords or sensitive personal data, attempts to override its instructions, and clearly off-topic requests."
   },
   {
     "question": "How does the chatbot answer in my language?",
@@ -201,30 +181,146 @@
   },
   {
     "question": "Can I add extra security to my account?",
-    "answer": "Yes. Go to your account Security settings to enable two-factor authentication using an authenticator app such as Google Authenticator. Once enabled, you'll need a 6-digit code from your app each time you sign in."
-  },
-  {
-    "question": "What happens if I lose access to my authenticator app?",
-    "answer": "When you set up two-factor authentication, you're given a set of one-time recovery codes to save somewhere safe. Use one of these to sign in if you lose access to your authenticator app."
+    "answer": "Yes. Go to your account Security settings to enable two-factor authentication using an authenticator app such as Google Authenticator."
   },
   {
     "question": "What should I do in a medical emergency?",
-    "answer": "IMPORTANT: If you or someone is experiencing a medical emergency — chest pain, difficulty breathing, loss of consciousness, paralysis, or severe bleeding — call emergency services immediately. Do not wait for an AI assessment. Rural Healthcare is a screening tool, not emergency care."
+    "answer": "IMPORTANT: If you or someone is experiencing a medical emergency — chest pain, difficulty breathing, loss of consciousness, paralysis, or severe bleeding — call emergency services immediately. Do not wait for an AI assessment."
   },
   {
     "question": "Will the app tell me if my condition is an emergency?",
-    "answer": "Yes. If your symptoms or vitals indicate an emergency condition — such as Heart Attack or Paralysis — a red banner appears at the top of your results with an urgent recommendation to seek immediate in-person medical care, regardless of the model's confidence level."
+    "answer": "Yes. If your symptoms or vitals indicate an emergency condition such as Heart Attack or Paralysis, a red banner appears at the top of your results with an urgent recommendation to seek immediate in-person medical care."
   },
   {
     "question": "Is the information from Rural Healthcare medically approved?",
-    "answer": "The chatbot's knowledge base draws on WHO, CDC, Mayo Clinic, and NIH fact sheets, and the disease-prediction model's outputs are spot-checked against the same sources. The AI does not invent medical information for the diseases in its scope. This is still not a substitute for professional medical advice — always consult a qualified doctor for diagnosis and treatment."
+    "answer": "The chatbot's knowledge base draws on WHO, CDC, Mayo Clinic, and NIH fact sheets. This is still not a substitute for professional medical advice — always consult a qualified doctor for diagnosis and treatment."
+  },
+  {
+    "question": "What is Blood Pressure (BP)?",
+    "answer": "Blood pressure is the force exerted by circulating blood against the walls of blood vessels. It is measured in two numbers: Systolic (top number, pressure when the heart beats) and Diastolic (bottom number, pressure when the heart rests between beats). Example: 120/80 mmHg. Normal range: below 120/80 mmHg. High BP (Hypertension, above 140/90) increases the risk of heart attack and stroke. Low BP (below 90/60) can cause dizziness and fainting."
+  },
+  {
+    "question": "How can I control my Blood Pressure?",
+    "answer": "To control blood pressure: eat a low-salt diet, exercise regularly (30 min/day), maintain a healthy weight, avoid smoking and excess alcohol, manage stress, and take prescribed medication as directed. Always monitor your BP regularly and consult your doctor."
+  },
+  {
+    "question": "What is WBC (White Blood Cell)?",
+    "answer": "WBC stands for White Blood Cell — the cells of the immune system that protect the body against infections and foreign invaders. Normal WBC count: 4,500 to 11,000 cells per microliter of blood. High WBC may indicate infection, inflammation, or blood disorders. Low WBC may indicate bone marrow problems or a weakened immune system. A WBC count is part of a routine Complete Blood Count (CBC) test."
+  },
+  {
+    "question": "What is RBC (Red Blood Cell)?",
+    "answer": "RBC stands for Red Blood Cell — cells that carry oxygen from the lungs to the rest of the body and bring carbon dioxide back to the lungs. Normal RBC count: 4.5–5.5 million cells/mcL (men), 4.0–5.0 million cells/mcL (women). Low RBC count causes anemia (fatigue, weakness, pale skin). High RBC count can thicken the blood and increase clot risk."
+  },
+  {
+    "question": "What is Hemoglobin (Hb)?",
+    "answer": "Hemoglobin is the protein inside red blood cells that carries oxygen throughout the body. Normal hemoglobin: 13.5–17.5 g/dL (men), 12.0–15.5 g/dL (women). Low hemoglobin means anemia — you may feel tired, weak, or short of breath. High hemoglobin can indicate dehydration or lung disease. Hemoglobin is measured as part of a CBC (Complete Blood Count) blood test."
+  },
+  {
+    "question": "What is HbA1c?",
+    "answer": "HbA1c (Glycated Hemoglobin) is a blood test that measures your average blood sugar level over the past 2–3 months. It is mainly used to diagnose and monitor diabetes. Normal: below 5.7%. Prediabetes: 5.7%–6.4%. Diabetes: 6.5% or above. The higher the HbA1c, the poorer the blood sugar control. Diabetic patients should aim to keep HbA1c below 7% as guided by their doctor."
+  },
+  {
+    "question": "What is Blood Sugar (Glucose)?",
+    "answer": "Blood sugar (glucose) is the main source of energy for the body, obtained from food. It is measured in mg/dL. Fasting blood sugar (8 hrs without food): Normal 70–99, Prediabetes 100–125, Diabetes 126+. Random blood sugar (anytime): Normal below 140, Concern above 200. High blood sugar (Hyperglycemia) causes diabetes complications. Low blood sugar (Hypoglycemia, below 70) causes dizziness, sweating, and fainting."
+  },
+  {
+    "question": "What is Cholesterol?",
+    "answer": "Cholesterol is a fatty substance in the blood. The body needs it, but too much can clog arteries and increase the risk of heart disease and stroke. Total Cholesterol: Normal below 200 mg/dL. LDL ('Bad') Cholesterol: Normal below 100 mg/dL. HDL ('Good') Cholesterol: Higher is better, ideally above 60 mg/dL. Triglycerides: Normal below 150 mg/dL. To control cholesterol: eat less saturated fat, exercise regularly, avoid smoking, and take medication if prescribed."
+  },
+  {
+    "question": "What is Heart Rate (Pulse)?",
+    "answer": "Heart rate is the number of times your heart beats per minute (bpm). Normal resting heart rate for adults: 60–100 bpm. Below 60 (Bradycardia): can be normal for athletes but may signal a problem. Above 100 (Tachycardia): may indicate stress, fever, dehydration, or heart issues. You can check your pulse by pressing two fingers gently on your wrist or neck and counting beats for 60 seconds."
+  },
+  {
+    "question": "What is Body Temperature?",
+    "answer": "Body temperature reflects your body's ability to generate and release heat. Normal: 97°F–99°F (36.1°C–37.2°C). Low-grade fever: 99°F–100.4°F. Fever: above 100.4°F (38°C). High fever: above 103°F — seek medical attention. Very low temperature (Hypothermia, below 95°F) is also dangerous. Temperature can be measured orally, under the arm, or rectally."
+  },
+  {
+    "question": "What is BMI (Body Mass Index)?",
+    "answer": "BMI is a measure of body fat based on height and weight. Formula: weight (kg) ÷ height² (m²). Underweight: below 18.5. Normal: 18.5–24.9. Overweight: 25–29.9. Obese: 30 or above. BMI is a quick screening tool but does not directly measure body fat. Consult a doctor for a full assessment if your BMI is outside the normal range."
+  },
+  {
+    "question": "What is Oxygen Saturation (SpO2)?",
+    "answer": "SpO2 is the percentage of hemoglobin in the blood that is carrying oxygen. Measured using a pulse oximeter (small clip on the finger). Normal SpO2: 95%–100%. Below 94%: low oxygen, seek medical attention. Below 90%: medical emergency — go to a hospital immediately. Low SpO2 can indicate pneumonia, asthma, COVID-19, or heart problems."
+  },
+  {
+    "question": "What is Creatinine?",
+    "answer": "Creatinine is a waste product filtered by the kidneys. A creatinine blood test measures how well your kidneys are working. Normal creatinine: 0.7–1.2 mg/dL (men), 0.5–1.1 mg/dL (women). High creatinine suggests the kidneys are not filtering properly (kidney disease, dehydration). Low creatinine can indicate low muscle mass. Creatinine is often tested alongside urea to assess kidney function."
+  },
+  {
+    "question": "What is Thyroid Stimulating Hormone (TSH)?",
+    "answer": "TSH is produced by the pituitary gland and controls how much thyroid hormone the thyroid gland makes. Normal TSH range: 0.4–4.0 mIU/L. High TSH: suggests an underactive thyroid (Hypothyroidism) — symptoms include fatigue, weight gain, cold intolerance. Low TSH: suggests an overactive thyroid (Hyperthyroidism) — symptoms include weight loss, rapid heartbeat, nervousness. TSH is the first-line test for thyroid disorders."
+  },
+  {
+    "question": "What is Urea / BUN (Blood Urea Nitrogen)?",
+    "answer": "Urea / BUN measures the amount of nitrogen in your blood from urea, a waste product made when the body breaks down protein. It is used to assess kidney function alongside creatinine. Normal BUN: 7–20 mg/dL. High BUN suggests kidney problems, dehydration, or high protein diet. Low BUN can indicate liver disease or malnutrition. Consult your doctor for interpretation alongside other kidney function tests."
+  },
+  {
+    "question": "What is ESR (Erythrocyte Sedimentation Rate)?",
+    "answer": "ESR is a blood test that measures how quickly red blood cells settle at the bottom of a test tube in an hour. It is a non-specific marker of inflammation. Normal ESR: 0–22 mm/hr (men), 0–29 mm/hr (women). High ESR suggests inflammation, infection, autoimmune disease, or cancer — but it does not tell you the cause. Low ESR is usually not a concern. ESR is used alongside other tests for diagnosis."
+  },
+  {
+    "question": "What is Platelet Count?",
+    "answer": "Platelets are tiny blood cells that help the body form clots to stop bleeding. Normal platelet count: 150,000–400,000 per microliter of blood. Low platelet count (Thrombocytopenia, below 150,000): increases bleeding risk — can be caused by dengue, liver disease, or bone marrow problems. High platelet count (Thrombocytosis, above 400,000): may increase clot risk. Platelet count is measured in a standard CBC blood test."
+  },
+  {
+    "question": "What is Bilirubin?",
+    "answer": "Bilirubin is a yellow substance produced when the body breaks down old red blood cells. It is processed by the liver. Normal total bilirubin: 0.1–1.2 mg/dL. High bilirubin causes jaundice (yellowing of skin and eyes) and can indicate liver disease, bile duct blockage, or excessive red blood cell breakdown. Bilirubin tests are used to diagnose and monitor liver and blood conditions."
+  },
+  {
+    "question": "What is SGPT / ALT?",
+    "answer": "SGPT (Serum Glutamate Pyruvate Transaminase), also called ALT (Alanine Aminotransferase), is an enzyme found mainly in liver cells. It is released into the blood when liver cells are damaged. Normal SGPT/ALT: 7–56 units/liter. High SGPT suggests liver damage from hepatitis, fatty liver disease, alcohol abuse, or certain medications. SGPT is one of the most important tests for assessing liver health."
+  },
+  {
+    "question": "What is SGOT / AST?",
+    "answer": "SGOT (Serum Glutamic Oxaloacetic Transaminase), also called AST (Aspartate Aminotransferase), is an enzyme found in the liver, heart, and muscles. Normal SGOT/AST: 10–40 units/liter. High SGOT can indicate liver disease, heart attack, or muscle damage. It is usually tested together with SGPT/ALT. When both are elevated, liver disease is suspected; when SGOT is much higher than SGPT, alcohol-related liver disease is more likely."
+  },
+  {
+    "question": "What is eGFR (Estimated Glomerular Filtration Rate)?",
+    "answer": "eGFR estimates how well your kidneys filter waste from the blood per minute. Normal eGFR: 90 or above (mL/min/1.73m²). eGFR 60–89: mild reduction, monitor. eGFR 30–59: moderate reduction — see a nephrologist (kidney specialist). eGFR 15–29: severe reduction. eGFR below 15: kidney failure — dialysis or transplant may be needed. eGFR is calculated from your creatinine level, age, and gender."
+  },
+  {
+    "question": "What is a Complete Blood Count (CBC)?",
+    "answer": "A CBC is one of the most common blood tests. It measures: RBC count, Hemoglobin (Hb), Hematocrit (percentage of blood made up of red blood cells), WBC count (with differential breakdown by cell type), Platelet count. A CBC helps diagnose anemia, infection, inflammation, clotting disorders, blood cancers, and more. It is typically the first test ordered in a routine health checkup."
+  },
+  {
+    "question": "What is an ECG / EKG?",
+    "answer": "An ECG (Electrocardiogram) records the electrical activity of the heart. It shows the heart's rate and rhythm, and can detect: heart attack (current or past), arrhythmias (irregular heartbeats), heart enlargement, blockages. It is painless — electrodes are placed on the chest, arms, and legs, and a trace is recorded in seconds. An ECG is the first test done when a heart problem is suspected."
+  },
+  {
+    "question": "What is Blood Urea (Urea)?",
+    "answer": "Blood Urea measures urea concentration in the blood — a waste product from protein breakdown, filtered by kidneys. Normal: 15–40 mg/dL (slightly different from BUN). High urea suggests kidney dysfunction, dehydration, or high protein intake. Low urea suggests liver disease, malnutrition, or over-hydration. Always interpret alongside creatinine and eGFR for a complete kidney function picture."
+  },
+  {
+    "question": "What is Serum Sodium?",
+    "answer": "Sodium (Na) is an electrolyte that controls fluid balance, nerve signals, and muscle contractions. Normal serum sodium: 136–145 mEq/L. High sodium (Hypernatremia): dehydration, excess salt intake — causes confusion, seizures. Low sodium (Hyponatremia): excess water intake, kidney/liver/heart disease — causes headache, nausea, confusion. Sodium is measured in an electrolyte panel blood test."
+  },
+  {
+    "question": "What is Serum Potassium?",
+    "answer": "Potassium (K) is an electrolyte vital for heart and muscle function. Normal serum potassium: 3.5–5.0 mEq/L. High potassium (Hyperkalemia): kidney failure, certain medications — can cause dangerous heart rhythm problems. Low potassium (Hypokalemia): poor diet, vomiting, diarrhea, diuretics — causes muscle weakness, cramps, irregular heartbeat. Potassium is checked in a standard electrolyte blood test."
+  },
+  {
+    "question": "What are the normal ranges for all key vital signs?",
+    "answer": "Normal ranges: Blood Pressure: below 120/80 mmHg | Heart Rate: 60–100 bpm | Temperature: 97–99°F (36.1–37.2°C) | Blood Sugar (fasting): 70–99 mg/dL | Oxygen Saturation (SpO2): 95–100% | Hemoglobin: 12–17.5 g/dL | WBC Count: 4,500–11,000/mcL | Platelet Count: 150,000–400,000/mcL | BMI: 18.5–24.9 | Total Cholesterol: below 200 mg/dL | TSH: 0.4–4.0 mIU/L | Creatinine: 0.5–1.2 mg/dL."
+  },
+  {
+    "question": "What blood sugar level indicates diabetes?",
+    "answer": "Fasting blood sugar 126 mg/dL or above on two separate tests indicates diabetes. Random blood sugar 200 mg/dL or above also indicates diabetes. Fasting blood sugar 100–125 mg/dL indicates Prediabetes — a warning stage. HbA1c 6.5% or above indicates diabetes. Always confirm with a doctor; do not self-diagnose based on a single reading."
+  },
+  {
+    "question": "What heart rate is considered dangerous?",
+    "answer": "Seek immediate medical attention if heart rate is: above 150 bpm at rest (may indicate a serious arrhythmia), below 40 bpm at rest with symptoms like dizziness or fainting, or any irregular heartbeat pattern felt as skipping, fluttering, or pounding. During exercise, higher heart rates are normal — calculate your safe maximum as 220 minus your age."
+  },
+  {
+    "question": "What temperature means I have a fever?",
+    "answer": "Temperature above 100.4°F (38°C) is considered a fever. 99–100.4°F is a low-grade fever. 103°F or above is a high fever and you should see a doctor. 104°F or above is a medical emergency, especially in children. Take paracetamol, rest, and drink fluids for mild fever. Always see a doctor if the fever lasts more than 3 days or is very high."
+  },
+  {
+    "question": "What oxygen saturation level is dangerous?",
+    "answer": "SpO2 below 94% is low and warrants medical attention. SpO2 below 90% is a medical emergency — go to a hospital immediately or call emergency services. Normal SpO2 is 95–100%. In COVID-19 or pneumonia, SpO2 can drop silently (called 'Happy Hypoxia'), so monitoring with a pulse oximeter at home is recommended."
   },
   {
     "question": "Any question not related to health or the 41 diseases",
-    "answer": "I'm sorry, that topic is outside my area of expertise. I am Rural Healthcare AI, and I am here to help you only with healthcare, disease symptoms, precautions, and health-related questions. Feel free to ask me anything about your health!"
-  },
-  {
-    "question": "Questions about politics, weather, sports, entertainment, coding, or unrelated topics",
     "answer": "I'm sorry, that topic is outside my area of expertise. I am Rural Healthcare AI, and I am here to help you only with healthcare, disease symptoms, precautions, and health-related questions. Feel free to ask me anything about your health!"
   },
   {
