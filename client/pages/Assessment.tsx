@@ -15,6 +15,30 @@ import newCheckboxLabels from "@/new_checkbox_labels.json";
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:5001";
 
+// Physiologically-plausible ranges for the vitals form. Rejected here (and
+// again server-side in /predict -- never trust client-side validation
+// alone) rather than letting a 0/empty/out-of-range value through to a
+// prediction, e.g. "130/00 mmHg" or "00 mg/dL" reaching the results page.
+const VITAL_RANGES: Record<
+  "bloodPressureSystolic" | "bloodPressureDiastolic" | "heartRate" | "temperature" | "sugarLevel",
+  { min: number; max: number; label: string; unit: string }
+> = {
+  bloodPressureSystolic: { min: 70, max: 250, label: "systolic", unit: "mmHg" },
+  bloodPressureDiastolic: { min: 40, max: 130, label: "diastolic", unit: "mmHg" },
+  heartRate: { min: 20, max: 250, label: "heart rate", unit: "bpm" },
+  temperature: { min: 90, max: 115, label: "temperature", unit: "°F" },
+  sugarLevel: { min: 20, max: 600, label: "blood sugar", unit: "mg/dL" },
+};
+
+function vitalError(field: keyof typeof VITAL_RANGES, rawValue: string): string | null {
+  const { min, max, label, unit } = VITAL_RANGES[field];
+  const value = parseFloat(rawValue);
+  if (rawValue.trim() === "" || Number.isNaN(value) || value < min || value > max) {
+    return `Please enter a valid ${label} value (${min}–${max} ${unit})`;
+  }
+  return null;
+}
+
 interface SymptomOption {
   value: string;
   label: string;
@@ -66,6 +90,8 @@ export default function Assessment() {
     sugarLevel: "",
     symptoms: [] as string[],
   });
+
+  const [vitalErrors, setVitalErrors] = useState<Partial<Record<keyof typeof VITAL_RANGES, string>>>({});
 
   const [result, setResult] = useState<AssessmentResult | null>(null);
   
@@ -193,6 +219,12 @@ export default function Assessment() {
       ...prev,
       [name]: value,
     }));
+    // Re-validate as the user edits so a corrected value clears its error
+    // immediately, rather than leaving a stale message until next submit.
+    if (name in VITAL_RANGES) {
+      const field = name as keyof typeof VITAL_RANGES;
+      setVitalErrors(prev => ({ ...prev, [field]: vitalError(field, value) ?? undefined }));
+    }
   };
 
   const toggleSymptom = (symptom: string) => {
@@ -251,6 +283,26 @@ export default function Assessment() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Validate vitals are within physiologically-plausible ranges BEFORE
+    // submitting -- catches "130/00 mmHg", "00 mg/dL", etc. that native
+    // HTML `required` alone lets through (a non-empty "0" satisfies
+    // `required`; it just isn't a real value).
+    const nextErrors: Partial<Record<keyof typeof VITAL_RANGES, string>> = {};
+    (Object.keys(VITAL_RANGES) as (keyof typeof VITAL_RANGES)[]).forEach(field => {
+      const err = vitalError(field, formData[field]);
+      if (err) nextErrors[field] = err;
+    });
+    setVitalErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) {
+      const firstInvalidField = document.querySelector<HTMLElement>(
+        `[name="${Object.keys(nextErrors)[0]}"]`
+      );
+      firstInvalidField?.scrollIntoView({ behavior: "smooth", block: "center" });
+      firstInvalidField?.focus();
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -395,6 +447,7 @@ export default function Assessment() {
       sugarLevel: "",
       symptoms: [],
     });
+    setVitalErrors({});
     setResult(null);
     setShowResult(false);
     setAiSymptoms([]);
@@ -525,9 +578,16 @@ export default function Assessment() {
                         onChange={handleInputChange}
                         placeholder="e.g., 120"
                         className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary text-foreground bg-white"
-                        min="0"
+                        min={VITAL_RANGES.bloodPressureSystolic.min}
+                        max={VITAL_RANGES.bloodPressureSystolic.max}
                         required
                       />
+                      {vitalErrors.bloodPressureSystolic && (
+                        <p className="mt-1 flex items-center gap-1 text-xs text-red-600">
+                          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                          {vitalErrors.bloodPressureSystolic}
+                        </p>
+                      )}
                     </div>
                     <div>
                       <label className="block text-xs text-muted-foreground mb-1">Diastolic</label>
@@ -538,9 +598,16 @@ export default function Assessment() {
                         onChange={handleInputChange}
                         placeholder="e.g., 80"
                         className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary text-foreground bg-white"
-                        min="0"
+                        min={VITAL_RANGES.bloodPressureDiastolic.min}
+                        max={VITAL_RANGES.bloodPressureDiastolic.max}
                         required
                       />
+                      {vitalErrors.bloodPressureDiastolic && (
+                        <p className="mt-1 flex items-center gap-1 text-xs text-red-600">
+                          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                          {vitalErrors.bloodPressureDiastolic}
+                        </p>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -557,9 +624,16 @@ export default function Assessment() {
                     onChange={handleInputChange}
                     placeholder="Enter heart rate"
                     className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary text-foreground bg-white"
-                    min="0"
-                        required
+                    min={VITAL_RANGES.heartRate.min}
+                    max={VITAL_RANGES.heartRate.max}
+                    required
                   />
+                  {vitalErrors.heartRate && (
+                    <p className="mt-1 flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                      {vitalErrors.heartRate}
+                    </p>
+                  )}
                 </div>
 
                 {/* Temperature */}
@@ -575,9 +649,16 @@ export default function Assessment() {
                     placeholder="Enter temperature"
                     step="0.1"
                     className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary text-foreground bg-white"
-                    min="0"
+                    min={VITAL_RANGES.temperature.min}
+                    max={VITAL_RANGES.temperature.max}
                     required
                   />
+                  {vitalErrors.temperature && (
+                    <p className="mt-1 flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                      {vitalErrors.temperature}
+                    </p>
+                  )}
                 </div>
 
                 {/* Sugar Level */}
@@ -592,9 +673,16 @@ export default function Assessment() {
                     onChange={handleInputChange}
                     placeholder="Enter fasting blood sugar level"
                     className="w-full px-4 py-3 border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary text-foreground bg-white"
-                    min="0"
+                    min={VITAL_RANGES.sugarLevel.min}
+                    max={VITAL_RANGES.sugarLevel.max}
                     required
                   />
+                  {vitalErrors.sugarLevel && (
+                    <p className="mt-1 flex items-center gap-1 text-xs text-red-600">
+                      <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                      {vitalErrors.sugarLevel}
+                    </p>
+                  )}
                 </div>
 
                 {/* Lab Test Result field removed */}

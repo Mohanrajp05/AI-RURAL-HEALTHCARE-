@@ -145,10 +145,16 @@ const bpStatus = (sys: number, dia: number): VitalStatus => {
   return normal;
 };
 
+// Standard clinical bands: Normal 60-100, Elevated/Tachycardia 101-120,
+// High 121-150, Critical above 150 or below 40. 40-59 (mild bradycardia)
+// isn't one of those 4 named bands but must not silently fall through to
+// "Normal" either, so it's shown as the existing "Low" status.
 const hrStatus = (hr: number): VitalStatus => {
-  if (hr < 50 || hr > 110) return critical;
-  if (hr < 60 || hr > 100) return borderline;
-  return normal;
+  if (hr > 150 || hr < 40) return critical;
+  if (hr > 120) return high;
+  if (hr > 100) return { ...borderline, label: "Elevated" };
+  if (hr >= 60) return normal;
+  return low;
 };
 
 const tempStatus = (temp: number): VitalStatus => {

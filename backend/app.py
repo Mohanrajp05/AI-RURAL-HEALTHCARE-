@@ -3163,6 +3163,38 @@ def load_guarded_pipeline():
     """Load the new guarded 40-symptom ensemble lazily. Returns (ok, error)."""
     return _new_load_models()
 
+# Physiologically-plausible ranges for /predict's vitals, mirroring
+# Assessment.tsx's VITAL_RANGES exactly -- same reasoning: the frontend
+# form already blocks these, but never trust client-side validation
+# alone (a stale build, or a direct API call, must not be able to
+# produce a result like "130/00 mmHg" or "00 mg/dL").
+_VITAL_RANGES = {
+    "bloodPressureSystolic": (70, 250, "systolic", "mmHg"),
+    "bloodPressureDiastolic": (40, 130, "diastolic", "mmHg"),
+    "heartRate": (20, 250, "heart rate", "bpm"),
+    "temperature": (90, 115, "temperature", "°F"),
+    "sugarLevel": (20, 600, "blood sugar", "mg/dL"),
+}
+
+
+def _validate_vitals(data: dict) -> str | None:
+    """Return a clear error message for the first out-of-range/empty/zero
+    vital, or None when every vital is within its physiological range.
+    `to_float()` treats "" the same as an absent key (returns 0.0), so
+    emptiness is checked on the raw value first -- a request with no
+    vitals at all must not silently pass as "0, which happens to be
+    out of range" (same message either way, but this is the correct
+    reason)."""
+    for field, (min_val, max_val, label, unit) in _VITAL_RANGES.items():
+        raw = data.get(field)
+        if raw is None or str(raw).strip() == "":
+            return f"Please enter a valid {label} value ({min_val}–{max_val} {unit})"
+        value = to_float(raw, default=None)
+        if value is None or value < min_val or value > max_val:
+            return f"Please enter a valid {label} value ({min_val}–{max_val} {unit})"
+    return None
+
+
 def analyze_vitals(data):
     """Analyze vital signs independently — returns risk_category and vitals_analysis"""
     bp_sys = to_float(data.get('bloodPressureSystolic', 0))
@@ -3322,6 +3354,21 @@ def predict():
                 "disease": "Error",
                 "risk": 0,
                 "error": "No data provided"
+            }), 400
+
+        # Reject physiologically-impossible vitals (0, empty, or wildly
+        # out-of-range) here too -- never trust client-side validation
+        # alone. Assessment.tsx already blocks these at the form, but a
+        # request that reaches this endpoint by any other path (a stale
+        # frontend build, a direct API call) must not be able to produce
+        # a result like "130/00 mmHg" or "00 mg/dL". Same ranges as
+        # Assessment.tsx's VITAL_RANGES.
+        vitals_error = _validate_vitals(data)
+        if vitals_error:
+            return jsonify({
+                "disease": "Error",
+                "risk": 0,
+                "error": vitals_error,
             }), 400
 
         # Merge checkbox selections with AI-mapped extra symptoms, deduplicate
